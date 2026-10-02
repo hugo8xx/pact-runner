@@ -55,6 +55,9 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+HANDOFF = "## Handoff\n- Done: test\n- Repo / branch / PR / commit: no code"
+
+
 @dataclass
 class World:
     """A clean board with one owner (`boss`) and helpers to register things."""
