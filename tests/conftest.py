@@ -30,7 +30,7 @@ os.environ.setdefault("PACT_SIGNING_KEY", "test-signing-key-test-signing-key-012
 
 TABLES = (
     "entries, entry_chain_heads, payloads, task_activity, hook_cursors, context_note_versions, context_notes, notifications, "
-    "limit_usage, tasks, agent_tokens, agent_projects, "
+    "agent_keys, limit_usage, tasks, agent_tokens, agent_projects, "
     "mandates, agents, projects, humans"
 )
 
