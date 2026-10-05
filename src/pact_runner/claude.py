@@ -121,6 +121,8 @@ class Run:
 class Outcome:
     session_id: str | None = None
     num_turns: int = 0
+    turns_reported: bool = False
+    """Whether the result event carried ``num_turns``; without it the turns are unknown, not 0."""
     structured: dict[str, Any] | None = None
     subtype: str | None = None
     is_error: bool = False
@@ -225,6 +227,7 @@ class StreamReader:
             self.out.subtype = event.get("subtype")
             self.out.is_error = bool(event.get("is_error"))
             self.out.num_turns = int(event.get("num_turns") or 0)
+            self.out.turns_reported = isinstance(event.get("num_turns"), int)
             self.out.text = str(event.get("result") or "")
             so = event.get("structured_output")
             self.out.structured = so if isinstance(so, dict) else None

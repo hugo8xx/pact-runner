@@ -6,9 +6,12 @@ is deferred, not attempted) and 20 (the kill switch stops a running task and the
 
 import asyncio
 import json
+import logging
+import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,7 @@ from pact.board import Agent, Board
 from pact.db import fetchall, transaction
 from pact.errors import PactError
 from pact.scope import board_scope
+from pact_runner import worktree
 from pact_runner.board import BoardRefusal
 from pact_runner.config import RunnerConfig
 from pact_runner.runner import Runner
@@ -554,6 +558,88 @@ async def test_a_runner_with_no_live_mandate_stops(world: World, tmp_path: Path,
         await runner.tick()
     await runner._refused(info.value)
     assert runner.stopped == "mandate_revoked"
+
+
+# ── the log: one line when a run starts, one when it ends ──────────────────────────
+
+
+START = re.compile(r"^task start at=(\S+) agent=runner-web task=(\S+) title=(.+)$")
+END = re.compile(r"^task end at=(\S+) agent=runner-web task=(\S+) result=(\S+) duration=\d+\.\ds turns=(\S+)$")
+
+
+def run_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [m for r in caplog.records if (m := r.getMessage()).startswith(("task start ", "task end "))]
+
+
+def assert_iso_with_zone(at: str) -> None:
+    assert datetime.fromisoformat(at).tzinfo is not None
+
+
+@pytest.mark.parametrize(
+    ("mode", "result", "turns"),
+    [
+        ("completed", "completed", "3"),
+        ("input_required", "input_required", "3"),
+        ("defer", "defer", "3"),
+        ("quota", "rate-limited", "1"),
+        ("max_turns", "max-turns", "7"),
+    ],
+)
+async def test_a_run_logs_its_start_and_end(
+    world: World, tmp_path: Path, fake: Fake, caplog: pytest.LogCaptureFixture, mode: str, result: str, turns: str
+) -> None:
+    caplog.set_level(logging.INFO, logger="pact_runner")
+    runner = await setup(world, tmp_path, None)
+    fake.mode(mode)
+    title = "แก้ระบบ log ของ runner " * 10
+    tid = await delegate(world, title)
+    await once(runner)
+
+    start, end = run_lines(caplog)
+    s, e = START.match(start), END.match(end)
+    assert s and e, (start, end)
+    assert_iso_with_zone(s[1])
+    assert_iso_with_zone(e[1])
+    assert s[2] == e[2] == tid
+    shown = json.loads(s[3])
+    assert len(shown) == 80 and shown.endswith("…") and title.startswith(shown[:-1].rstrip())
+    assert (e[3], e[4]) == (result, turns)
+    assert all("Please fix the thing." not in m for m in caplog.messages)  # never the body
+
+
+async def test_a_timed_out_run_still_logs_its_end(
+    world: World, tmp_path: Path, fake: Fake, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="pact_runner")
+    runner = await setup(world, tmp_path, None, run_timeout_seconds=0.5, kill_grace_seconds=1)
+    fake.mode("sleep")
+    tid = await delegate(world, "slow one")
+    await asyncio.wait_for(once(runner), timeout=20)
+
+    start, end = run_lines(caplog)
+    assert START.match(start) and 'title="slow one"' in start
+    e = END.match(end)
+    assert e and (e[2], e[3], e[4]) == (tid, "timeout", "unknown")  # no result event, so no turns to tell
+
+
+async def test_a_run_that_crashes_still_logs_its_end(
+    world: World, tmp_path: Path, fake: Fake, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caplog.set_level(logging.INFO, logger="pact_runner")
+    runner = await setup(world, tmp_path, None)
+
+    async def broken(*args: Any) -> Path:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(worktree, "prepare", broken)
+    tid = await delegate(world)
+    await once(runner)
+
+    start, end = run_lines(caplog)
+    assert START.match(start)
+    e = END.match(end)
+    assert e and (e[2], e[3], e[4]) == (tid, "error", "unknown")
+    assert fake.calls() == []
 
 
 async def test_a_structured_report_reaches_people_as_a_card(world: World, tmp_path: Path, fake: Fake) -> None:

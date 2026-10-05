@@ -11,6 +11,9 @@ import json
 import logging
 import os
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,24 @@ TERMINAL = frozenset({"completed", "failed", "canceled", "rejected"})
 
 DROP = frozenset({"already_claimed", "wrong_agent", "invalid_request", "approval_pending", "not_found", "project_mismatch"})
 """Claim refusals that only mean "not this task": forget it and move on."""
+
+
+@dataclass
+class RunRecord:
+    """What a run's end line says: the outcome sent to the board (or why there was none) and the
+    turns ``claude -p`` reported. It stays "error" unless the run gets as far as an outcome."""
+
+    result: str = "error"
+    turns: int | None = None
+
+
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def short_title(title: str, limit: int = 80) -> str:
+    title = " ".join(title.split())
+    return title if len(title) <= limit else title[: limit - 1] + "…"
 
 
 def subtasks_prompt(subtasks: list[dict[str, Any]]) -> str:
@@ -169,20 +190,51 @@ class Runner:
 
     # ── one task ──────────────────────────────────────────────────────────
 
+    @contextmanager
+    def _logged(self, task: dict[str, Any]) -> Iterator[RunRecord]:
+        """One line when a run starts and one when it ends, however it ends. Only the title goes in
+        the log, never the body."""
+        record = RunRecord()
+        began = time.monotonic()
+        title = json.dumps(short_title(str(task.get("title") or "")), ensure_ascii=False)
+        log.info("task start at=%s agent=%s task=%s title=%s", _now(), self.cfg.agent_id, task["id"], title)
+        try:
+            yield record
+        except asyncio.CancelledError:
+            record.result = "cancelled"
+            raise
+        finally:
+            log.info(
+                "task end at=%s agent=%s task=%s result=%s duration=%.1fs turns=%s",
+                _now(),
+                self.cfg.agent_id,
+                task["id"],
+                record.result,
+                time.monotonic() - began,
+                "unknown" if record.turns is None else record.turns,
+            )
+
     async def _run_task(self, task: dict[str, Any], mandate: str, max_turns: int) -> None:
         task_id = task["id"]
-        try:
-            if max_turns < 1:
-                await self._report(task_id, mandate, "input_required", "The turns budget for this task is used up.")
-                return
-            await self._work(task, mandate, max_turns)
-        except Exception:
-            log.exception("task %s failed inside the runner", task_id)
-        finally:
-            self.running.pop(task_id, None)
+        with self._logged(task) as record:
+            try:
+                if max_turns < 1:
+                    await self._report(task_id, mandate, "input_required", "The turns budget for this task is used up.")
+                    record.result = "input_required"
+                    return
+                await self._work(task, mandate, max_turns, record)
+            except Exception:
+                log.exception("task %s failed inside the runner", task_id)
+            finally:
+                self.running.pop(task_id, None)
 
     async def _work(
-        self, task: dict[str, Any], mandate: str, max_turns: int, subtasks: list[dict[str, Any]] | None = None
+        self,
+        task: dict[str, Any],
+        mandate: str,
+        max_turns: int,
+        record: RunRecord,
+        subtasks: list[dict[str, Any]] | None = None,
     ) -> None:
         task_id = task["id"]
         workdir = await worktree.prepare(self.cfg.repo, self.cfg.state_dir / "work", task_id)
@@ -237,14 +289,18 @@ class Runner:
             out = await execute(
                 self.cfg, run_for(None), role, should_stop=halt, tick=heartbeat, tick_seconds=self.cfg.heartbeat_seconds
             )
+        record.turns = out.num_turns if out.turns_reported else None
         self._remember_quota(out)
         if out.session_id:
             self.store.save_session(Session(task_id, out.session_id, str(workdir), role_hash))
         if halt():
+            record.result = "claim_lost" if lost else "stopped"
             return  # the claim is gone or the runner is stopping; nobody to report to
-        await self._finish(task, mandate, workdir, branch, out, max_turns)
+        record.result = await self._finish(task, mandate, workdir, branch, out, max_turns)
 
-    async def _finish(self, task: dict[str, Any], mandate: str, workdir: Path, branch: str, out: Outcome, max_turns: int) -> None:
+    async def _finish(self, task: dict[str, Any], mandate: str, workdir: Path, branch: str, out: Outcome, max_turns: int) -> str:
+        """Report the run's outcome to the board; returns it for the log: the status sent, or
+        rate-limited, timeout, max-turns or error when the run did not finish with one."""
         task_id = task["id"]
         usage = {"turns": out.num_turns} if out.num_turns else None
         where = f"branch `{branch}`, session `{out.session_id}`, {out.num_turns} turns"
@@ -260,7 +316,8 @@ class Runner:
                 "Resume the task to continue from the saved session.",
                 usage,
             )
-        elif out.timed_out:
+            return "rate-limited"
+        if out.timed_out:
             await self._report(
                 task_id,
                 mandate,
@@ -269,7 +326,8 @@ class Runner:
                 "Resume the task to continue from the saved session, or cancel it.",
                 usage,
             )
-        elif status in ("completed", "failed"):
+            return "timeout"
+        if status in ("completed", "failed"):
             result = str(so.get("result") or "")
             if not has_handoff(result):
                 result += f"\n\n## Handoff\n- Runner {self.cfg.agent_id}: {where}\n- The session returned no handoff of its own."
@@ -278,9 +336,11 @@ class Runner:
             if await self._report(task_id, mandate, status, closing, usage):
                 await worktree.remove(self.cfg.repo, workdir)
                 self.store.forget_session(task_id)
-        elif status == "input_required":
+            return str(status)
+        if status == "input_required":
             await self._report(task_id, mandate, "input_required", so.get("question") or so.get("result") or "", usage)
-        elif status == "waiting":
+            return "input_required"
+        if status == "waiting":
             if not await self._subtasks(task_id):
                 await self._report(
                     task_id,
@@ -289,11 +349,13 @@ class Runner:
                     f"The session ended with status waiting but posted no subtasks ({where}).\n\n{so.get('result') or ''}",
                     usage,
                 )
-            elif not usage or await self._report(task_id, mandate, "working", None, usage):
+                return "input_required"
+            if not usage or await self._report(task_id, mandate, "working", None, usage):
                 self.store.wait(task, mandate, max_turns, time.time())
                 self.beats[task_id] = time.time()
                 log.info("task %s waits for its subtasks", task_id)
-        elif status == "defer":
+            return "waiting"
+        if status == "defer":
             if usage:
                 await self._report(task_id, mandate, "working", None, usage)
             try:
@@ -309,20 +371,18 @@ class Runner:
             except BoardRefusal as err:
                 if err.code != "claim_lost":
                     await self._refused(err)
-        else:
-            why = (
-                "ran out of turns"
-                if out.subtype == "error_max_turns"
-                else f"ended without a result ({out.subtype or out.exit_code})"
-            )
-            detail = (out.text or out.stderr).strip()[-1500:]
-            await self._report(
-                task_id,
-                mandate,
-                "input_required",
-                f"The run {why} ({where}).\n\n{detail}\n\nResume to continue from the saved session, or cancel.",
-                usage,
-            )
+            return "defer"
+        max_turns_hit = out.subtype == "error_max_turns"
+        why = "ran out of turns" if max_turns_hit else f"ended without a result ({out.subtype or out.exit_code})"
+        detail = (out.text or out.stderr).strip()[-1500:]
+        await self._report(
+            task_id,
+            mandate,
+            "input_required",
+            f"The run {why} ({where}).\n\n{detail}\n\nResume to continue from the saved session, or cancel.",
+            usage,
+        )
+        return "max-turns" if max_turns_hit else "error"
 
     # ── tasks it gives itself ─────────────────────────────────────────────
 
@@ -400,29 +460,31 @@ class Runner:
         """Wake the waiting session with its subtasks' results. That is another run, taken from the
         task's budget like the first."""
         task_id = w.task["id"]
-        try:
-            out = await self._call(
-                "pact_report", {"task_id": task_id, "status": "working", "mandate_id": w.mandate_id, "usage": {"runs": 1}}
-            )
-            budget = out.get("budget") or {}
-            turns = min(self.cfg.max_turns, int(budget.get("turns", self.cfg.max_turns)))
-            if "runs" in (out.get("budget_exceeded") or []) or turns < 1:
-                await self._report(
-                    task_id,
-                    w.mandate_id,
-                    "input_required",
-                    "The subtasks are done, but the budget has no run or turns left to finish the task.",
+        with self._logged(w.task) as record:
+            try:
+                out = await self._call(
+                    "pact_report", {"task_id": task_id, "status": "working", "mandate_id": w.mandate_id, "usage": {"runs": 1}}
                 )
-                return
-            self.store.count_run()
-            await self._work(w.task, w.mandate_id, turns, subtasks=subtasks)
-        except BoardRefusal as err:
-            if err.code != "claim_lost":
-                await self._refused(err)
-        except Exception:
-            log.exception("task %s failed inside the runner", task_id)
-        finally:
-            self.running.pop(task_id, None)
+                budget = out.get("budget") or {}
+                turns = min(self.cfg.max_turns, int(budget.get("turns", self.cfg.max_turns)))
+                if "runs" in (out.get("budget_exceeded") or []) or turns < 1:
+                    await self._report(
+                        task_id,
+                        w.mandate_id,
+                        "input_required",
+                        "The subtasks are done, but the budget has no run or turns left to finish the task.",
+                    )
+                    record.result = "input_required"
+                    return
+                self.store.count_run()
+                await self._work(w.task, w.mandate_id, turns, record, subtasks=subtasks)
+            except BoardRefusal as err:
+                if err.code != "claim_lost":
+                    await self._refused(err)
+            except Exception:
+                log.exception("task %s failed inside the runner", task_id)
+            finally:
+                self.running.pop(task_id, None)
 
     # ── helpers ───────────────────────────────────────────────────────────
 
