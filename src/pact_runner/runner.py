@@ -21,12 +21,24 @@ from . import worktree
 from .board import FATAL, BoardClient, BoardRefusal
 from .claude import Outcome, Run, execute, role_prompt
 from .config import RunnerConfig
-from .store import Session, Store
+from .store import Session, Store, Waiting
 
 log = logging.getLogger("pact_runner")
 
+TERMINAL = frozenset({"completed", "failed", "canceled", "rejected"})
+
 DROP = frozenset({"already_claimed", "wrong_agent", "invalid_request", "approval_pending", "not_found", "project_mismatch"})
 """Claim refusals that only mean "not this task": forget it and move on."""
+
+
+def subtasks_prompt(subtasks: list[dict[str, Any]]) -> str:
+    parts = ["Every subtask you posted is closed. Their results:"]
+    for t in subtasks:
+        result = t.get("result")
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        parts += ["", f"### {t['title']} ({t['status']}, {t.get('assignee') or t.get('delegate_to')})", (text or "")[:4000]]
+    parts += ["", "Continue the task with these results and finish it."]
+    return "\n".join(parts)
 
 
 def task_prompt(task: dict[str, Any]) -> str:
@@ -46,6 +58,8 @@ class Runner:
         self.since: int | None = None
         self.backlog: dict[str, dict[str, Any]] = {}
         self.running: dict[str, asyncio.Task[None]] = {}
+        self.beats: dict[str, float] = {}
+        """When each waiting task last sent a heartbeat."""
         self.stopped: str | None = None
         """Why the runner stopped for good; None while it runs."""
 
@@ -101,6 +115,7 @@ class Runner:
             else:
                 self.backlog.pop(task["id"], None)
         self.since = listed["next_since"]
+        await self._check_waiting()
         for task_id in list(self.backlog):
             if self.stopped or not self._may_start():
                 break
@@ -165,14 +180,17 @@ class Runner:
         finally:
             self.running.pop(task_id, None)
 
-    async def _work(self, task: dict[str, Any], mandate: str, max_turns: int) -> None:
+    async def _work(
+        self, task: dict[str, Any], mandate: str, max_turns: int, subtasks: list[dict[str, Any]] | None = None
+    ) -> None:
         task_id = task["id"]
         workdir = await worktree.prepare(self.cfg.repo, self.cfg.state_dir / "work", task_id)
         branch = worktree.branch_for(task_id)
-        role = role_prompt(self.cfg, task_id, branch)
+        role = role_prompt(self.cfg, task_id, branch, mandate, task.get("project_id") or self.project_id or "")
         role_hash = hashlib.sha256(role.encode()).hexdigest()
+        wake = "subtasks" if subtasks is not None else "answer" if task.get("answer") else "assignment"
         prior = self.store.session(task_id)
-        resume = prior.session_id if prior and prior.role_hash == role_hash and task.get("answer") else None
+        resume = prior.session_id if prior and prior.role_hash == role_hash and wake != "assignment" else None
         lost = False
 
         async def heartbeat() -> None:
@@ -185,9 +203,13 @@ class Runner:
                     await self._refused(err)
 
         def run_for(resume_id: str | None) -> Run:
-            prompt = (
-                f"A person answered your question:\n\n{task['answer']}\n\nContinue the task." if resume_id else task_prompt(task)
-            )
+            if wake == "subtasks":
+                follow_up = subtasks_prompt(subtasks or [])
+                prompt = follow_up if resume_id else f"{task_prompt(task)}\n\n{follow_up}"
+            elif resume_id:
+                prompt = f"A person answered your question:\n\n{task['answer']}\n\nContinue the task."
+            else:
+                prompt = task_prompt(task)
             return Run(
                 task_id=task_id,
                 prompt=prompt,
@@ -199,7 +221,7 @@ class Runner:
                 env={
                     "PACT_TASK_ID": task_id,
                     "PACT_MANDATE_ID": mandate,
-                    "PACT_WAKE_REASON": "answer" if task.get("answer") else "assignment",
+                    "PACT_WAKE_REASON": wake,
                 },
             )
 
@@ -219,9 +241,9 @@ class Runner:
             self.store.save_session(Session(task_id, out.session_id, str(workdir), role_hash))
         if halt():
             return  # the claim is gone or the runner is stopping; nobody to report to
-        await self._finish(task, mandate, workdir, branch, out)
+        await self._finish(task, mandate, workdir, branch, out, max_turns)
 
-    async def _finish(self, task: dict[str, Any], mandate: str, workdir: Path, branch: str, out: Outcome) -> None:
+    async def _finish(self, task: dict[str, Any], mandate: str, workdir: Path, branch: str, out: Outcome, max_turns: int) -> None:
         task_id = task["id"]
         usage = {"turns": out.num_turns} if out.num_turns else None
         where = f"branch `{branch}`, session `{out.session_id}`, {out.num_turns} turns"
@@ -255,6 +277,19 @@ class Runner:
                 self.store.forget_session(task_id)
         elif status == "input_required":
             await self._report(task_id, mandate, "input_required", so.get("question") or so.get("result") or "", usage)
+        elif status == "waiting":
+            if not await self._subtasks(task_id):
+                await self._report(
+                    task_id,
+                    mandate,
+                    "input_required",
+                    f"The session ended with status waiting but posted no subtasks ({where}).\n\n{so.get('result') or ''}",
+                    usage,
+                )
+            elif not usage or await self._report(task_id, mandate, "working", None, usage):
+                self.store.wait(task, mandate, max_turns, time.time())
+                self.beats[task_id] = time.time()
+                log.info("task %s waits for its subtasks", task_id)
         elif status == "defer":
             if usage:
                 await self._report(task_id, mandate, "working", None, usage)
@@ -285,6 +320,73 @@ class Runner:
                 f"The run {why} ({where}).\n\n{detail}\n\nResume to continue from the saved session, or cancel.",
                 usage,
             )
+
+    # ── tasks waiting for sub-agents ──────────────────────────────────────
+
+    async def _subtasks(self, task_id: str) -> list[dict[str, Any]]:
+        listed = await self._call(
+            "pact_list", {"mandate_id": self.mandate_id, "filter": "all", "parent_task_id": task_id, "limit": 200}
+        )
+        deferred = [t for t in listed.get("deferred", []) if t.get("parent_task_id") == task_id]
+        return [*listed["tasks"], *deferred]
+
+    async def _check_waiting(self) -> None:
+        """Keep the claim of every waiting task alive, and resume a task once all its subtasks are
+        closed. A task that waits too long goes to a person."""
+        now = time.time()
+        for w in self.store.waiting():
+            task_id = w.task["id"]
+            if task_id in self.running or self.stopped:
+                continue
+            if now - self.beats.get(task_id, 0) >= self.cfg.heartbeat_seconds:
+                if not await self._report(task_id, w.mandate_id, "working", None):
+                    self.store.unwait(task_id)
+                    continue
+                self.beats[task_id] = now
+            subtasks = await self._subtasks(task_id)
+            still_open = [t for t in subtasks if t["status"] not in TERMINAL]
+            if not still_open:
+                if self._may_start():
+                    self.store.unwait(task_id)
+                    self.running[task_id] = asyncio.create_task(self._resume_after_subtasks(w, subtasks))
+            elif now - w.since > self.cfg.max_wait_seconds:
+                self.store.unwait(task_id)
+                titles = ", ".join(f"{t['title']} ({t['status']})" for t in still_open)
+                await self._report(
+                    task_id,
+                    w.mandate_id,
+                    "input_required",
+                    f"Waited {self.cfg.max_wait_seconds / 3600:g} hours for subtasks that are still open: {titles}. "
+                    "Resume the task to continue without them, or cancel it.",
+                )
+
+    async def _resume_after_subtasks(self, w: Waiting, subtasks: list[dict[str, Any]]) -> None:
+        """Wake the waiting session with its subtasks' results. That is another run, taken from the
+        task's budget like the first."""
+        task_id = w.task["id"]
+        try:
+            out = await self._call(
+                "pact_report", {"task_id": task_id, "status": "working", "mandate_id": w.mandate_id, "usage": {"runs": 1}}
+            )
+            budget = out.get("budget") or {}
+            turns = min(self.cfg.max_turns, int(budget.get("turns", self.cfg.max_turns)))
+            if "runs" in (out.get("budget_exceeded") or []) or turns < 1:
+                await self._report(
+                    task_id,
+                    w.mandate_id,
+                    "input_required",
+                    "The subtasks are done, but the budget has no run or turns left to finish the task.",
+                )
+                return
+            self.store.count_run()
+            await self._work(w.task, w.mandate_id, turns, subtasks=subtasks)
+        except BoardRefusal as err:
+            if err.code != "claim_lost":
+                await self._refused(err)
+        except Exception:
+            log.exception("task %s failed inside the runner", task_id)
+        finally:
+            self.running.pop(task_id, None)
 
     # ── helpers ───────────────────────────────────────────────────────────
 

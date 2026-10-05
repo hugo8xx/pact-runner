@@ -24,8 +24,11 @@ FINAL_SCHEMA: dict[str, Any] = {
     "properties": {
         "status": {
             "type": "string",
-            "enum": ["completed", "failed", "input_required", "defer"],
-            "description": "completed/failed close the task; input_required asks a person; defer = needs more authority.",
+            "enum": ["completed", "failed", "input_required", "defer", "waiting"],
+            "description": (
+                "completed/failed close the task; input_required asks a person; defer = needs more authority; "
+                "waiting = you posted subtasks and want to be resumed with their results."
+            ),
         },
         "result": {
             "type": "string",
@@ -49,13 +52,22 @@ Rules:
 - Stay inside the task. Commit to your branch and push it; open a PR with `gh pr create` when there is
   code to review. Never push to main or another protected branch, never force-push, never merge.
 - Read the project's notes with pact_note before you start, and follow the repository's own checks.
-- To split work for a sub-agent use pact_post with parent_task_id={task} and child_limits taken from
-  your own budget; never ask for more authority.
+- {workers}
 - You cannot claim or close tasks yourself. End by returning the structured result:
   completed or failed (result holds a '## Handoff' section: what was done; repo / branch / PR / commit;
   checks; what is left; what needs a person), input_required (a question only a person can answer),
-  or defer (the task needs authority your mandate lacks; give needed_scope).
+  defer (the task needs authority your mandate lacks; give needed_scope), or waiting (see above).
 """
+
+WORKERS = """To split off work that can run on its own, post a subtask: pact_post with project_id={project},
+  mandate_id={mandate}, parent_task_id={task}, delegate_to one of {names}, a self-contained title and
+  body (the worker sees nothing else), and child_limits such as {{"runs": 1, "turns": 20}} taken from
+  your own budget. No person approves it while it stays within your budget. Then end with status
+  waiting; you are resumed in this session with every subtask's result. Never wait or poll yourself.
+  If pact_post is refused (scope_exceeded: this task was not given task.post; limit_exceeded: not
+  enough budget), do the work yourself instead."""
+
+NO_WORKERS = "You have no sub-agents: do the work yourself and never end with status waiting."
 
 _QUOTA_TEXT = re.compile(
     r"usage limit|rate limit|hit your limit|limit reached|5-hour limit|weekly limit|out of extra usage|"
@@ -96,9 +108,14 @@ class Outcome:
         return self.is_error and "no conversation found" in (self.text + self.stderr).lower()
 
 
-def role_prompt(cfg: RunnerConfig, task_id: str, branch: str) -> str:
+def role_prompt(cfg: RunnerConfig, task_id: str, branch: str, mandate_id: str = "", project_id: str = "") -> str:
     extra = cfg.role_file.read_text() if cfg.role_file else ""
-    return ROLE.format(agent=cfg.agent_id, branch=branch, task=task_id) + ("\n" + extra if extra else "")
+    workers = (
+        WORKERS.format(project=project_id, mandate=mandate_id, task=task_id, names=", ".join(cfg.workers))
+        if cfg.workers
+        else NO_WORKERS
+    )
+    return ROLE.format(agent=cfg.agent_id, branch=branch, workers=workers) + ("\n" + extra if extra else "")
 
 
 def settings(cfg: RunnerConfig) -> dict[str, Any]:
