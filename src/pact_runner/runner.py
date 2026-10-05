@@ -273,7 +273,9 @@ class Runner:
             result = str(so.get("result") or "")
             if not has_handoff(result):
                 result += f"\n\n## Handoff\n- Runner {self.cfg.agent_id}: {where}\n- The session returned no handoff of its own."
-            if await self._report(task_id, mandate, status, result, usage):
+            # A structured report travels with the text, which keeps the handoff.
+            closing: Any = {"report": so["report"], "handoff": result} if isinstance(so.get("report"), dict) else result
+            if await self._report(task_id, mandate, status, closing, usage):
                 await worktree.remove(self.cfg.repo, workdir)
                 self.store.forget_session(task_id)
         elif status == "input_required":

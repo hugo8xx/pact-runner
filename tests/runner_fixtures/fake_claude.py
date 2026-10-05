@@ -68,6 +68,11 @@ results = {
     "input_required": {"status": "input_required", "result": "", "question": "Which colour?"},
     "defer": {"status": "defer", "result": "Needs a deploy.", "needed_scope": ["deploy.web@project:web"]},
     "waiting": {"status": "waiting", "result": "Handed the docs to a worker."},
+    "report": {
+        "status": "completed",
+        "result": "Brief.\n\n## Handoff\n- Done: brief",
+        "report": {"greeting": "Morning", "sections": [{"title": "Progress", "items": [{"text": "R3 done"}]}]},
+    },
     "child": {"status": "completed", "result": "Docs written.\n\n## Handoff\n- Done: docs on the worker's branch"},
 }
 if mode == "quota":

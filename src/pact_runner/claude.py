@@ -40,6 +40,35 @@ FINAL_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "description": "For defer: the scope the task would need, e.g. deploy.web@project:pact.",
         },
+        "report": {
+            "type": "object",
+            "description": "Only for a report task (action report.brief): the report as sections, shown to people as a card.",
+            "properties": {
+                "greeting": {"type": "string"},
+                "sections": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "text": {"type": "string"},
+                                        "task_id": {"type": "string", "description": "The board task this item is about."},
+                                    },
+                                    "required": ["text"],
+                                },
+                            },
+                        },
+                        "required": ["title", "items"],
+                    },
+                },
+            },
+            "required": ["sections"],
+        },
     },
     "required": ["status", "result"],
 }

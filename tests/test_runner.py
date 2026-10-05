@@ -554,3 +554,13 @@ async def test_a_runner_with_no_live_mandate_stops(world: World, tmp_path: Path,
         await runner.tick()
     await runner._refused(info.value)
     assert runner.stopped == "mandate_revoked"
+
+
+async def test_a_structured_report_reaches_people_as_a_card(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None)
+    fake.mode("report")
+    tid = await delegate(world)
+    await once(runner)
+    row = await task_row(world, tid)
+    assert row["status"] == "completed" and row["result"]["report"]["greeting"] == "Morning"
+    assert "## Handoff" in row["result"]["handoff"]
