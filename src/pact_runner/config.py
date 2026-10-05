@@ -20,6 +20,7 @@ DEFAULT_ALLOWED_TOOLS = (
     "Bash(git diff:*)",
     "Bash(git log:*)",
     "Bash(git show:*)",
+    "Bash(git fetch:*)",
     "Bash(git add:*)",
     "Bash(git commit:*)",
     "Bash(git switch -c:*)",
