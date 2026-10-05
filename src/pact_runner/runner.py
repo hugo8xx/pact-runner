@@ -116,6 +116,7 @@ class Runner:
                 self.backlog.pop(task["id"], None)
         self.since = listed["next_since"]
         await self._check_waiting()
+        await self._post_scheduled()
         for task_id in list(self.backlog):
             if self.stopped or not self._may_start():
                 break
@@ -319,6 +320,39 @@ class Runner:
                 "input_required",
                 f"The run {why} ({where}).\n\n{detail}\n\nResume to continue from the saved session, or cancel.",
                 usage,
+            )
+
+    # ── tasks it gives itself ─────────────────────────────────────────────
+
+    async def _post_scheduled(self, now: datetime | None = None) -> None:
+        """Once a day per scheduled job, from its time on (a sleeping Mac catches up the same day):
+        post the task under the runner's own mandate and claim it straight away."""
+        now = now or datetime.now()
+        today = now.date().isoformat()
+        for job in self.cfg.schedule:
+            key = f"schedule:{job.title}"
+            last = self.store.get(key) or {}
+            if last.get("date") == today or (now.hour, now.minute) < job.at:
+                continue
+            if self.stopped or not self._may_start():
+                return
+            head = (await self._call("pact_list", {"mandate_id": self.mandate_id, "filter": "mine", "limit": 1}))["head"]
+            body = job.body.replace("{date}", today).replace("{since}", str(last.get("head", 0)))
+            title = f"{job.title} {today}"
+            posted = await self._call(
+                "pact_post",
+                {
+                    "project_id": self.project_id,
+                    "title": title,
+                    "body": body,
+                    "action": job.action,
+                    "mandate_id": self.mandate_id,
+                },
+            )
+            self.store.put(key, {"date": today, "head": head})
+            log.info("posted scheduled task %s: %s", posted["task_id"], title)
+            await self._claim_and_start(
+                {"id": posted["task_id"], "title": title, "body": body, "project_id": self.project_id, "delegate_to": None}
             )
 
     # ── tasks waiting for sub-agents ──────────────────────────────────────
