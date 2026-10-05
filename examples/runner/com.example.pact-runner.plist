@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  A macOS LaunchAgent for pact-runner. Replace every /Users/you path, save it as
+  ~/Library/LaunchAgents/com.example.pact-runner.plist, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.pact-runner.plist
+  It runs as you, so `claude` uses your login. The runner exits 0 when the board tells it to stop
+  (kill switch, paused agent, dead mandate); KeepAlive restarts it only after a crash.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.pact-runner</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>set -a; . /Users/you/.config/pact/runner-myproject.env; exec /Users/you/pact-board/.venv/bin/pact-runner</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/you/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/you/Library/Logs/pact-runner.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/you/Library/Logs/pact-runner.log</string>
+</dict>
+</plist>
