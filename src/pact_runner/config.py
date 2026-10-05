@@ -78,6 +78,10 @@ class RunnerConfig:
     mandate_id: str | None = None
     """The runner's own (root) mandate; by default the first live one pact_whoami lists."""
     project_id: str | None = None
+    workers: tuple[str, ...] = ()
+    """Runner agents a session may hand subtasks to (``PACT_RUNNER_WORKERS``); none means no sub-agents."""
+    max_wait_seconds: float = 24 * 3600
+    """How long a task may wait for its subtasks before a person is asked."""
     take_open: bool = False
     """Also take open tasks delegated to nobody. Off: only tasks delegated to this runner."""
     poll_seconds: float = 30
@@ -131,6 +135,8 @@ class RunnerConfig:
             mandate_id=_env("PACT_RUNNER_MANDATE") or None,
             project_id=_env("PACT_RUNNER_PROJECT") or None,
             take_open=_env("PACT_RUNNER_TAKE_OPEN") == "1",
+            workers=_list("PACT_RUNNER_WORKERS", ()),
+            max_wait_seconds=float(_env("PACT_RUNNER_MAX_WAIT_HOURS", "24")) * 3600,
             poll_seconds=float(_env("PACT_RUNNER_POLL_SECONDS", "30")),
             heartbeat_seconds=float(_env("PACT_RUNNER_HEARTBEAT_SECONDS", "600")),
             run_timeout_seconds=float(_env("PACT_RUNNER_RUN_TIMEOUT_MINUTES", "30")) * 60,

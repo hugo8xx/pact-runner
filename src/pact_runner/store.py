@@ -17,6 +17,14 @@ class Session:
     role_hash: str
 
 
+@dataclass(frozen=True)
+class Waiting:
+    task: dict[str, Any]
+    mandate_id: str
+    max_turns: int
+    since: float
+
+
 class Store:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -26,7 +34,10 @@ class Store:
                  task_id text PRIMARY KEY, session_id text NOT NULL, workdir text NOT NULL, role_hash text NOT NULL,
                  updated_at text NOT NULL DEFAULT CURRENT_TIMESTAMP);
                CREATE TABLE IF NOT EXISTS runs (day text PRIMARY KEY, count integer NOT NULL);
-               CREATE TABLE IF NOT EXISTS state (key text PRIMARY KEY, value text NOT NULL);"""
+               CREATE TABLE IF NOT EXISTS state (key text PRIMARY KEY, value text NOT NULL);
+               CREATE TABLE IF NOT EXISTS waiting (
+                 task_id text PRIMARY KEY, mandate_id text NOT NULL, task text NOT NULL, max_turns integer NOT NULL,
+                 since real NOT NULL);"""
         )
         self.db.commit()
 
@@ -47,6 +58,22 @@ class Store:
 
     def forget_session(self, task_id: str) -> None:
         self.db.execute("DELETE FROM sessions WHERE task_id = ?", (task_id,))
+        self.db.commit()
+
+    def wait(self, task: dict[str, Any], mandate_id: str, max_turns: int, since: float) -> None:
+        """Hold a task whose session handed work to sub-agents, until they are all done."""
+        self.db.execute(
+            "INSERT OR REPLACE INTO waiting (task_id, mandate_id, task, max_turns, since) VALUES (?, ?, ?, ?, ?)",
+            (task["id"], mandate_id, json.dumps(task), max_turns, since),
+        )
+        self.db.commit()
+
+    def waiting(self) -> list[Waiting]:
+        rows = self.db.execute("SELECT task, mandate_id, max_turns, since FROM waiting ORDER BY since").fetchall()
+        return [Waiting(json.loads(t), m, int(n), float(s)) for t, m, n, s in rows]
+
+    def unwait(self, task_id: str) -> None:
+        self.db.execute("DELETE FROM waiting WHERE task_id = ?", (task_id,))
         self.db.commit()
 
     def runs_today(self, today: date | None = None) -> int:

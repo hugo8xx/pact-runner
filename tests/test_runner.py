@@ -17,6 +17,7 @@ import pytest
 from pact.board import Agent, Board
 from pact.db import fetchall, transaction
 from pact.errors import PactError
+from pact.scope import board_scope
 from pact_runner.board import BoardRefusal
 from pact_runner.config import RunnerConfig
 from pact_runner.runner import Runner
@@ -59,6 +60,12 @@ class Fake:
 
     def mode(self, mode: str) -> None:
         self.control.write_text(json.dumps({"mode": mode, "log": str(self.log)}))
+
+    def script(self, *modes: str) -> None:
+        self.control.write_text(json.dumps({"script": list(modes), "log": str(self.log)}))
+
+    def release(self) -> None:
+        (self.control.parent / "release").write_text("")
 
     def calls(self) -> list[dict[str, Any]]:
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
@@ -298,3 +305,176 @@ async def test_the_mcp_config_holds_the_token_for_the_owner_only(world: World, t
     assert (
         server["url"] == "http://board.invalid/mcp/a/runner-web" and server["headers"]["Authorization"] == "Bearer secret-token"
     )
+
+
+# ── sub-agents (R2) ───────────────────────────────────────────────────────────
+
+
+SPLITTABLE = [board_scope(a, "web") for a in ("task.read", "task.work", "task.post")]
+"""A task's mandate must carry task.post for its runner to hand part of it to a worker."""
+
+
+async def worker_for(w: World, tmp: Path, runner: Runner) -> Runner:
+    """A second runner agent, the one the first hands subtasks to."""
+    await w.agent("worker-web", "runner", ["web"])
+    config = RunnerConfig(
+        board_url="http://board.invalid",
+        agent_id="worker-web",
+        token="worker-token",
+        state_dir=tmp / "worker-state",
+        claude=runner.cfg.claude,
+    )
+    worker = Runner(config, InProcessBoard(w.board, w.agents["worker-web"]))
+    await worker.start()
+    return worker
+
+
+async def post_subtask(w: World, parent: str, parent_mandate: str, limits: dict[str, float]) -> str:
+    """What the parent's session does through its pact tools: hand part of the work to the worker."""
+    t = await w.board.post(
+        w.agents["runner-web"],
+        project_id="web",
+        title="write the docs",
+        body="Write the docs for the fix.",
+        mandate_id=parent_mandate,
+        parent_task_id=parent,
+        delegate_to="worker-web",
+        child_limits=limits,
+    )
+    return str(t["task_id"])
+
+
+async def started(fake: Fake, calls: int) -> None:
+    while len(fake.calls()) < calls:  # noqa: ASYNC110 — the fake runs in another process
+        await asyncio.sleep(0.05)
+
+
+async def test_a_task_hands_work_to_a_worker_and_resumes_with_its_result(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None, workers=("worker-web",))
+    worker = await worker_for(world, tmp_path, runner)
+    fake.script("waiting", "child", "completed")
+    t = await world.board.post(
+        world.agents["chat-boss"],
+        project_id="web",
+        title="fix and document",
+        mandate_id=world.roots["chat-boss"],
+        delegate_to="runner-web",
+        child_limits={"runs": 3, "turns": 60},
+        child_scope=SPLITTABLE,
+    )
+    parent, parent_mandate = str(t["task_id"]), str(t["delegated_mandate_id"])
+
+    await runner.tick()
+    await started(fake, 1)
+    [first] = fake.calls()
+    assert "worker-web" in first["argv"][first["argv"].index("--append-system-prompt") + 1]  # the role names the worker
+    child = await post_subtask(world, parent, parent_mandate, {"runs": 1, "turns": 20})
+    fake.release()
+    await runner.drain()
+    assert (await task_row(world, parent))["status"] == "working"  # held, not closed, not handed to a person
+
+    await once(worker)
+    assert (await task_row(world, child))["status"] == "completed"
+
+    # A fresh Runner on the same state picks the wait up again, as after a restart.
+    again = Runner(runner.cfg, runner.board, runner.store)
+    await again.start()
+    await once(again)
+    calls = fake.calls()
+    assert len(calls) == 3
+    resumed = calls[2]
+    assert resumed["argv"][resumed["argv"].index("--resume") + 1].startswith("sess-")
+    assert "Docs written." in resumed["stdin"] and resumed["env"]["PACT_WAKE_REASON"] == "subtasks"
+    assert (await task_row(world, parent))["status"] == "completed"
+
+    async with transaction(world.pool) as conn:
+        used = {
+            r["limit_key"]: float(r["used"])
+            for r in await fetchall(conn, "SELECT limit_key, used FROM limit_usage WHERE mandate_id = %s", (parent_mandate,))
+        }
+    assert used == {"runs": 3, "turns": 9}  # first run, the worker's run, the resumed run; 3 turns each
+
+
+async def test_waiting_without_subtasks_asks_a_person(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None, workers=("worker-web",))
+    fake.mode("waiting")
+    fake.release()
+    tid = await delegate(world)
+    await once(runner)
+    row = await task_row(world, tid)
+    assert row["status"] == "input_required" and "posted no subtasks" in row["result"]
+
+
+async def test_a_wait_that_runs_too_long_asks_a_person(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None, workers=("worker-web",), max_wait_seconds=0.5)
+    await worker_for(world, tmp_path, runner)
+    fake.mode("waiting")
+    t = await world.board.post(
+        world.agents["chat-boss"],
+        project_id="web",
+        title="fix and document",
+        mandate_id=world.roots["chat-boss"],
+        delegate_to="runner-web",
+        child_limits={"runs": 3, "turns": 60},
+        child_scope=SPLITTABLE,
+    )
+    await runner.tick()
+    await started(fake, 1)
+    await post_subtask(world, str(t["task_id"]), str(t["delegated_mandate_id"]), {"runs": 1, "turns": 20})
+    fake.release()
+    await runner.drain()
+    await asyncio.sleep(0.6)
+    await once(runner)
+    row = await task_row(world, str(t["task_id"]))
+    assert row["status"] == "input_required" and "write the docs (submitted)" in row["result"]
+
+
+async def test_no_run_left_to_resume_asks_a_person(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None, workers=("worker-web",))
+    worker = await worker_for(world, tmp_path, runner)
+    fake.script("waiting", "child")
+    t = await world.board.post(
+        world.agents["chat-boss"],
+        project_id="web",
+        title="fix and document",
+        mandate_id=world.roots["chat-boss"],
+        delegate_to="runner-web",
+        child_limits={"runs": 2, "turns": 60},
+        child_scope=SPLITTABLE,
+    )
+    parent = str(t["task_id"])
+    await runner.tick()
+    await started(fake, 1)
+    await post_subtask(world, parent, str(t["delegated_mandate_id"]), {"runs": 1, "turns": 20})
+    fake.release()
+    await runner.drain()
+    await once(worker)
+    await once(runner)
+    row = await task_row(world, parent)
+    assert row["status"] == "input_required" and "no run or turns left" in row["result"]
+    assert len(fake.calls()) == 2
+
+
+async def test_without_workers_the_role_says_so(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None)
+    await delegate(world)
+    await once(runner)
+    [call] = fake.calls()
+    role = call["argv"][call["argv"].index("--append-system-prompt") + 1]
+    assert "no sub-agents" in role and "parent_task_id=" not in role
+
+
+async def test_without_task_post_the_subtask_is_refused(world: World, tmp_path: Path, fake: Fake) -> None:
+    """Splitting work is authority too: a task delegated without task.post cannot be split."""
+    runner = await setup(world, tmp_path, None, workers=("worker-web",))
+    await worker_for(world, tmp_path, runner)
+    t = await world.board.post(
+        world.agents["chat-boss"],
+        project_id="web",
+        title="just do it",
+        mandate_id=world.roots["chat-boss"],
+        delegate_to="runner-web",
+    )
+    with pytest.raises(PactError) as info:
+        await post_subtask(world, str(t["task_id"]), str(t["delegated_mandate_id"]), {"runs": 1})
+    assert info.value.code == "scope_exceeded"
