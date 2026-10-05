@@ -642,6 +642,113 @@ async def test_a_run_that_crashes_still_logs_its_end(
     assert fake.calls() == []
 
 
+# ── the log: one line when a limit starts holding runs back, one when it lifts ─────
+
+
+HELD = re.compile(r"^runner held reason=(\S+) (.+) task=(\S+) resume=(\S+)$")
+RESUMED = re.compile(r"^runner resumed reason=(\S+) cleared task=(\S+)$")
+
+
+def limit_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage().startswith(("runner held ", "runner resumed "))]
+
+
+async def test_the_daily_run_cap_logs_when_it_starts_and_when_it_lifts(
+    world: World, tmp_path: Path, fake: Fake, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="pact_runner")
+    runner = await setup(world, tmp_path, None, max_runs_per_day=1)
+    runner.store.count_run()
+    tid = await delegate(world)
+    for _ in range(3):  # three polls while the cap holds: one line
+        await once(runner)
+    [held] = limit_lines(caplog)
+    m = HELD.match(held.getMessage())
+    assert m and held.levelno == logging.WARNING, held.getMessage()
+    assert (m[1], m[2], m[3]) == ("daily_run_cap", "runs_today=1/1", tid)
+    resume = datetime.fromisoformat(m[4])
+    assert resume.tzinfo is not None and (resume.hour, resume.minute) == (0, 0) and resume > datetime.now().astimezone()
+    assert (await task_row(world, tid))["status"] == "submitted" and fake.calls() == []
+
+    runner.store.db.execute("DELETE FROM runs")  # a new day
+    runner.store.db.commit()
+    for _ in range(2):
+        await once(runner)
+    _, resumed = limit_lines(caplog)  # lifted once, then quiet
+    r = RESUMED.match(resumed.getMessage())
+    assert r and resumed.levelno == logging.INFO and (r[1], r[2]) == ("daily_run_cap", tid)
+    assert (await task_row(world, tid))["status"] == "completed"
+
+
+async def test_the_quota_reserve_logs_when_it_starts_and_when_it_lifts(
+    world: World, tmp_path: Path, fake: Fake, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="pact_runner")
+    runner = await setup(world, tmp_path, None)
+    resets = time.time() + 600
+    runner.store.put("rate_limit", {"unifiedWindows": {"five_hour": {"utilization": 0.82, "resetsAt": resets}}})
+    tid = await delegate(world)
+    for _ in range(3):
+        await once(runner)
+    [held] = limit_lines(caplog)
+    m = HELD.match(held.getMessage())
+    assert m and held.levelno == logging.WARNING, held.getMessage()
+    assert (m[1], m[2], m[3]) == ("quota_reserve", "window=five_hour quota_used=82%/limit=70%", tid)
+    assert datetime.fromisoformat(m[4]).timestamp() == int(resets)
+    assert fake.calls() == []
+
+    runner.store.put("rate_limit", {"unifiedWindows": {"five_hour": {"utilization": 0.1, "resetsAt": resets}}})
+    for _ in range(2):
+        await once(runner)
+    _, resumed = limit_lines(caplog)
+    r = RESUMED.match(resumed.getMessage())
+    assert r and (r[1], r[2]) == ("quota_reserve", tid)
+    assert (await task_row(world, tid))["status"] == "completed"
+
+
+async def test_a_usage_limit_pause_logs_as_the_quota_reserve(
+    world: World, tmp_path: Path, fake: Fake, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="pact_runner")
+    runner = await setup(world, tmp_path, None)
+    until = time.time() + 1800
+    runner.store.put("paused_until", until)
+    tid = await delegate(world)
+    await once(runner)
+    [held] = limit_lines(caplog)
+    m = HELD.match(held.getMessage())
+    assert m and (m[1], m[2], m[3]) == ("quota_reserve", "window=usage_limit quota=rate_limited", tid)
+    assert datetime.fromisoformat(m[4]).timestamp() == int(until)
+
+
+async def test_another_rule_taking_over_logs_again_and_a_lift_logs_without_a_task(
+    world: World, tmp_path: Path, fake: Fake, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="pact_runner")
+    runner = await setup(world, tmp_path, None, max_runs_per_day=1)
+    runner.store.put("rate_limit", {"unifiedWindows": {"seven_day": {"utilization": 0.9, "resetsAt": time.time() + 600}}})
+    tid = await delegate(world)
+    await once(runner)
+    runner.store.count_run()  # the daily cap now holds runs back first
+    await once(runner)
+    await once(runner)
+    first, second = (HELD.match(r.getMessage()) for r in limit_lines(caplog))
+    assert first and second
+    assert (first[1], first[2]) == ("quota_reserve", "window=seven_day quota_used=90%/limit=80%")
+    assert (second[1], second[2], second[3]) == ("daily_run_cap", "runs_today=1/1", tid)
+
+    runner.backlog.clear()
+    runner.store.put("rate_limit", {})
+    runner.store.db.execute("DELETE FROM runs")
+    runner.store.db.commit()
+    await once(runner)  # nothing left to start, but the lift still shows
+    await once(runner)
+    *_, resumed = limit_lines(caplog)
+    assert len(limit_lines(caplog)) == 3
+    r = RESUMED.match(resumed.getMessage())
+    assert r and (r[1], r[2]) == ("daily_run_cap", "none")
+
+
 async def test_a_structured_report_reaches_people_as_a_card(world: World, tmp_path: Path, fake: Fake) -> None:
     runner = await setup(world, tmp_path, None)
     fake.mode("report")

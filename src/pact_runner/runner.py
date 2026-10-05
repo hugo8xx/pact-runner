@@ -14,7 +14,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -43,8 +43,22 @@ class RunRecord:
     turns: int | None = None
 
 
+@dataclass(frozen=True)
+class Limit:
+    """Why the runner holds new runs back. ``reason`` is a grep-able constant (daily_run_cap,
+    quota_reserve), ``detail`` the reading against the line, ``resume`` when it lifts or unknown."""
+
+    reason: str
+    detail: str
+    resume: str
+
+
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _at(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
 
 
 def short_title(title: str, limit: int = 80) -> str:
@@ -83,6 +97,8 @@ class Runner:
         """When each waiting task last sent a heartbeat."""
         self.stopped: str | None = None
         """Why the runner stopped for good; None while it runs."""
+        self.limit: Limit | None = None
+        """The limit last logged as holding runs back, so a poll logs only when it starts or lifts."""
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -139,38 +155,64 @@ class Runner:
         await self._check_waiting()
         await self._post_scheduled()
         for task_id in list(self.backlog):
-            if self.stopped or not self._may_start():
+            if self.stopped or not self._may_start(task_id):
                 break
             if task_id in self.running:
                 continue
             await self._claim_and_start(self.backlog.pop(task_id))
+        if self.limit:
+            self._note_limit(self._limit(), None)  # a limit lifts in the log even with no task to start
 
-    def _may_start(self) -> bool:
+    def _may_start(self, task: str | None = None) -> bool:
+        """Whether a new run may start now. ``task`` names the run held back, for the log line."""
         if len(self.running) >= self.cfg.concurrency:
             return False
-        if self.store.runs_today() >= self.cfg.max_runs_per_day:
+        limit = self._limit()
+        self._note_limit(limit, task)
+        if limit:
             return False
         if self.cfg.quiet_hours:
             start, end = self.cfg.quiet_hours
             hour = datetime.now().hour
             if (start <= hour < end) if start <= end else (hour >= start or hour < end):
                 return False
-        return self._quota_allows()
+        return True
 
-    def _quota_allows(self) -> bool:
+    def _limit(self) -> Limit | None:
+        """The daily run cap or the quota reserve, whichever holds new runs back first."""
+        runs = self.store.runs_today()
+        if runs >= self.cfg.max_runs_per_day:
+            midnight = datetime.combine(datetime.now().date() + timedelta(days=1), datetime.min.time())
+            return Limit("daily_run_cap", f"runs_today={runs}/{self.cfg.max_runs_per_day}", _at(midnight.timestamp()))
+        return self._quota_limit()
+
+    def _quota_limit(self) -> Limit | None:
         """Leave the owner their share of the subscription: no new run while a quota window is past
         its reserve line or a rate limit is in force, until that window resets."""
         now = time.time()
         paused = self.store.get("paused_until")
         if paused and now < float(paused):
-            return False
+            return Limit("quota_reserve", "window=usage_limit quota=rate_limited", _at(float(paused)))
         info = self.store.get("rate_limit") or {}
         windows = info.get("unifiedWindows") or {}
         for name, line in (("five_hour", self.cfg.reserve_five_hour), ("seven_day", self.cfg.reserve_seven_day)):
             w = windows.get(name) or {}
-            if float(w.get("utilization") or 0) >= line and now < float(w.get("resetsAt") or 0):
-                return False
-        return True
+            used, resets = float(w.get("utilization") or 0), float(w.get("resetsAt") or 0)
+            if used >= line and now < resets:
+                return Limit("quota_reserve", f"window={name} quota_used={used:.0%}/limit={line:.0%}", _at(resets))
+        return None
+
+    def _note_limit(self, limit: Limit | None, task: str | None) -> None:
+        """One line when a limit starts holding a run back (or a different rule takes over), one when
+        it lifts; nothing on the polls in between."""
+        if limit and limit.reason != (self.limit and self.limit.reason):
+            if task is None:
+                return  # nothing is held back yet
+            log.warning("runner held reason=%s %s task=%s resume=%s", limit.reason, limit.detail, task, limit.resume or "unknown")
+            self.limit = limit
+        elif not limit and self.limit:
+            log.info("runner resumed reason=%s cleared task=%s", self.limit.reason, task or "none")
+            self.limit = None
 
     async def _claim_and_start(self, task: dict[str, Any]) -> None:
         mandate = task.get("delegated_mandate_id") if task.get("delegate_to") == self.cfg.agent_id else None
@@ -396,7 +438,7 @@ class Runner:
             last = self.store.get(key) or {}
             if last.get("date") == today or (now.hour, now.minute) < job.at:
                 continue
-            if self.stopped or not self._may_start():
+            if self.stopped or not self._may_start(f"scheduled:{json.dumps(job.title, ensure_ascii=False)}"):
                 return
             head = (await self._call("pact_list", {"mandate_id": self.mandate_id, "filter": "mine", "limit": 1}))["head"]
             body = job.body.replace("{date}", today).replace("{since}", str(last.get("head", 0)))
@@ -442,7 +484,7 @@ class Runner:
             subtasks = await self._subtasks(task_id)
             still_open = [t for t in subtasks if t["status"] not in TERMINAL]
             if not still_open:
-                if self._may_start():
+                if self._may_start(task_id):
                     self.store.unwait(task_id)
                     self.running[task_id] = asyncio.create_task(self._resume_after_subtasks(w, subtasks))
             elif now - w.since > self.cfg.max_wait_seconds:
