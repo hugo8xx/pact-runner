@@ -449,8 +449,23 @@ class Runner:
         try:
             await self._call("pact_list", {"mandate_id": self.mandate_id, "filter": "mine", "limit": 1})
         except BoardRefusal as again:
-            if again.code in FATAL:
+            if again.code in FATAL and not (again.code != "agent_paused" and await self._renewed()):
                 self.stop(again.code)
+
+    async def _renewed(self) -> bool:
+        """When the runner's own mandate dies, carry on under the newest live root mandate a person
+        issued since, if there is one. Renewing a runner is then just issuing it a new mandate."""
+        try:
+            me = await self._call("pact_whoami", {})
+        except BoardRefusal:
+            return False
+        roots = [m for m in me["mandates"] if m["parent_id"] is None and m["id"] != self.mandate_id]
+        if not roots:
+            return False
+        newest = max(roots, key=lambda m: m["expires_at"])
+        log.warning("mandate %s is gone; continuing under %s (expires %s)", self.mandate_id, newest["id"], newest["expires_at"])
+        self.mandate_id = newest["id"]
+        return True
 
     def _remember_quota(self, out: Outcome) -> None:
         if out.rate_limit:
