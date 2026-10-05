@@ -26,5 +26,10 @@ Rules:
 - Bother the CEO only with what needs the CEO: irreversible, a change of direction, or something
   only they know.
 
-End with status completed. `result` is the brief, followed by a `## Handoff` section (it is kept
-out of the message the CEO gets).
+End with status completed and fill `report`, which the CEO gets as a Slack card:
+- `greeting`: one line with the date.
+- `sections`: the four parts above, in that order, skipping empty ones. Each part has a `title` such as
+  "Waiting for you (2)" and its `items`. An item is one short `text` (plain, no links) plus the
+  `task_id` it is about, so the card can give it an "open task" button.
+
+`result` is the same brief as text, followed by a `## Handoff` section (kept out of the card).
