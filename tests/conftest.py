@@ -29,7 +29,7 @@ os.environ.setdefault("DATABASE_URL", "postgres://localhost:5432/pact_test")
 os.environ.setdefault("PACT_SIGNING_KEY", "test-signing-key-test-signing-key-0123456789")
 
 TABLES = (
-    "entries, entry_chain_heads, payloads, task_activity, hook_cursors, context_note_versions, context_notes, notifications, "
+    "entries, entry_chain_heads, payloads, task_activity, hook_cursors, context_note_versions, context_notes, notifications, expiry_notices, "
     "credential_revocations, credential_revocation_version, credential_links, agent_keys, trusted_roots, limit_usage, tasks, "
     "agent_tokens, agent_projects, "
     "mandates, agents, projects, humans"

@@ -526,3 +526,31 @@ async def test_a_scheduled_brief_runs_once_a_day_and_reaches_people_whole(world:
     await runner.drain()
     since = int(fake.calls()[1]["stdin"].split("Changes since ")[1].split(",")[0])
     assert since > 0  # the next brief starts where the previous one was posted, after "old news"
+
+
+# ── renewal ───────────────────────────────────────────────────────────────────
+
+
+async def test_a_runner_carries_on_under_a_renewed_mandate(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None)
+    old = runner.mandate_id
+    new = await world.admin.issue_mandate(
+        "runner-web", by="boss", scope=["task.read@project:web", "task.post@project:web", "task.work@project:web"], days=7
+    )
+    await world.admin.revoke_mandate(old, by="boss")  # the old one dies, as when it expires
+    with pytest.raises(BoardRefusal) as info:
+        await runner.tick()
+    await runner._refused(info.value)
+    assert runner.stopped is None and runner.mandate_id == new
+    tid = await delegate(world)
+    await once(runner)
+    assert (await task_row(world, tid))["status"] == "completed"
+
+
+async def test_a_runner_with_no_live_mandate_stops(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None)
+    await world.admin.revoke_mandate(runner.mandate_id, by="boss")
+    with pytest.raises(BoardRefusal) as info:
+        await runner.tick()
+    await runner._refused(info.value)
+    assert runner.stopped == "mandate_revoked"
