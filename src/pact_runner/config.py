@@ -1,5 +1,6 @@
 """Runner settings, read from the environment (a launchd job passes them in, or an env file)."""
 
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -67,6 +68,30 @@ def _hours(raw: str) -> tuple[int, int] | None:
     return start, end
 
 
+@dataclass(frozen=True)
+class Scheduled:
+    """A task the runner gives itself once a day, from ``at`` (local time) on: posted, then claimed."""
+
+    at: tuple[int, int]
+    title: str
+    body: str = ""
+    """``{date}`` becomes today's date; ``{since}`` the board's change cursor when the previous one was posted."""
+    action: str = "task.work"
+
+
+def _schedule(raw: str) -> tuple[Scheduled, ...]:
+    """``PACT_RUNNER_SCHEDULE``: a JSON list of {"at": "07:30", "title": ..., "body": ..., "action": ...}."""
+    if not raw:
+        return ()
+    out = []
+    for job in json.loads(raw):
+        hour, minute = (int(x) for x in str(job["at"]).split(":", 1))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"PACT_RUNNER_SCHEDULE: bad time {job['at']!r}")
+        out.append(Scheduled((hour, minute), str(job["title"]), str(job.get("body", "")), str(job.get("action", "task.work"))))
+    return tuple(out)
+
+
 @dataclass
 class RunnerConfig:
     board_url: str
@@ -82,6 +107,7 @@ class RunnerConfig:
     """Runner agents a session may hand subtasks to (``PACT_RUNNER_WORKERS``); none means no sub-agents."""
     max_wait_seconds: float = 24 * 3600
     """How long a task may wait for its subtasks before a person is asked."""
+    schedule: tuple[Scheduled, ...] = ()
     take_open: bool = False
     """Also take open tasks delegated to nobody. Off: only tasks delegated to this runner."""
     poll_seconds: float = 30
@@ -135,6 +161,7 @@ class RunnerConfig:
             mandate_id=_env("PACT_RUNNER_MANDATE") or None,
             project_id=_env("PACT_RUNNER_PROJECT") or None,
             take_open=_env("PACT_RUNNER_TAKE_OPEN") == "1",
+            schedule=_schedule(_env("PACT_RUNNER_SCHEDULE")),
             workers=_list("PACT_RUNNER_WORKERS", ()),
             max_wait_seconds=float(_env("PACT_RUNNER_MAX_WAIT_HOURS", "24")) * 3600,
             poll_seconds=float(_env("PACT_RUNNER_POLL_SECONDS", "30")),

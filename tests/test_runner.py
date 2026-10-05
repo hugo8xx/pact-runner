@@ -45,6 +45,7 @@ class InProcessBoard:
             "pact_claim": self.board.claim,
             "pact_report": self.board.report,
             "pact_defer": self.board.defer,
+            "pact_post": self.board.post,
         }[tool]
         try:
             return await fn(self.agent, **args)  # type: ignore[operator]
@@ -478,3 +479,50 @@ async def test_without_task_post_the_subtask_is_refused(world: World, tmp_path: 
     with pytest.raises(PactError) as info:
         await post_subtask(world, str(t["task_id"]), str(t["delegated_mandate_id"]), {"runs": 1})
     assert info.value.code == "scope_exceeded"
+
+
+# ── the secretary's daily brief (R3) ──────────────────────────────────────────
+
+
+async def test_a_scheduled_brief_runs_once_a_day_and_reaches_people_whole(world: World, tmp_path: Path, fake: Fake) -> None:
+    from datetime import datetime, timedelta
+
+    from pact_runner.config import Scheduled
+
+    await world.project("web")
+    await world.agent("chat-boss", "chat", ["web"])
+    scope = [board_scope(a, "web") for a in ("task.read", "task.post", "report.brief")]
+    await world.agent("runner-web", "runner", ["web"], scope=scope, limits={"runs": 5, "turns": 100})
+    job = Scheduled((7, 30), "Daily brief", "Changes since {since}, for {date}.", "report.brief")
+    config = RunnerConfig(
+        board_url="http://board.invalid",
+        agent_id="runner-web",
+        token="t",
+        state_dir=tmp_path / "state",
+        claude=(sys.executable, str(FAKE)),
+        schedule=(job,),
+    )
+    runner = Runner(config, InProcessBoard(world.board, world.agents["runner-web"]))
+    await runner.start()
+    morning = datetime(2026, 10, 6, 7, 0)
+
+    await world.board.post(world.agents["chat-boss"], project_id="web", title="old news", mandate_id=world.roots["chat-boss"])
+    await runner._post_scheduled(morning)  # before 07:30: nothing yet
+    assert fake.calls() == []
+    await runner._post_scheduled(morning.replace(hour=8))
+    await runner.drain()
+    await runner._post_scheduled(morning.replace(hour=9))  # same day: not again
+    await runner.drain()
+    [call] = fake.calls()
+    assert "Changes since 0, for 2026-10-06." in call["stdin"]
+
+    async with transaction(world.pool) as conn:
+        rows = await fetchall(conn, "SELECT kind, title, detail FROM notifications ORDER BY id")
+        [task] = await fetchall(conn, "SELECT status, action FROM tasks WHERE title LIKE 'Daily brief%%'")
+    assert task == {"status": "completed", "action": "report.brief"}
+    assert rows == [{"kind": "brief", "title": "Daily brief 2026-10-06", "detail": "Fixed it."}]  # no handoff, no task_closed
+
+    await runner._post_scheduled(morning + timedelta(days=1, hours=1))
+    await runner.drain()
+    since = int(fake.calls()[1]["stdin"].split("Changes since ")[1].split(",")[0])
+    assert since > 0  # the next brief starts where the previous one was posted, after "old news"
