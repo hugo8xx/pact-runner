@@ -93,6 +93,8 @@ WORKERS = """To split off work that can run on its own, post a subtask: pact_pos
   body (the worker sees nothing else), and child_limits such as {{"runs": 1, "turns": 20}} taken from
   your own budget. No person approves it while it stays within your budget. Then end with status
   waiting; you are resumed in this session with every subtask's result. Never wait or poll yourself.
+  Resuming costs one more run from this task's budget (the task prompt shows what is left): give the
+  subtasks at most the runs left minus one, and if fewer than two runs are left, do the work yourself.
   If pact_post is refused (scope_exceeded: this task was not given task.post; limit_exceeded: not
   enough budget), do the work yourself instead."""
 

@@ -78,6 +78,10 @@ def subtasks_prompt(subtasks: list[dict[str, Any]]) -> str:
 
 def task_prompt(task: dict[str, Any]) -> str:
     parts = [f"# Task {task['id']}: {task['title']}", "", task.get("body") or "(no body)"]
+    budget = task.get("_budget")
+    if budget:
+        left = ", ".join(f"{k} {v:g}" for k, v in sorted(budget.items()))
+        parts += ["", f"Budget left on this task's mandate after this run started: {left}."]
     if task.get("answer"):
         parts += ["", "## A person answered an earlier question", "", str(task["answer"])]
     return "\n".join(parts)
@@ -227,6 +231,7 @@ class Runner:
             return
         self.store.count_run()
         budget = claimed.get("budget") or {}
+        task["_budget"] = budget
         turns = self.cfg.max_turns if "turns" not in budget else min(self.cfg.max_turns, int(budget["turns"]))
         self.running[task["id"]] = asyncio.create_task(self._run_task(task, mandate, turns))
 
