@@ -469,6 +469,18 @@ async def test_without_workers_the_role_says_so(world: World, tmp_path: Path, fa
     assert "no sub-agents" in role and "parent_task_id=" not in role
 
 
+async def test_a_fresh_session_gets_the_owners_claude_md_and_a_resume_does_not(world: World, tmp_path: Path, fake: Fake) -> None:
+    rules = tmp_path / "CLAUDE.md"
+    rules.write_text("Write commit messages as Conventional Commits.")
+    runner = await setup(world, tmp_path, None, context_files=(rules,))
+    await delegate(world)
+    await once(runner)
+    [call] = fake.calls()
+    argv = call["argv"]
+    assert "Conventional Commits" in argv[argv.index("--append-system-prompt") + 1]
+    assert argv[argv.index("--setting-sources") + 1] == "project"  # the owner's settings still never load
+
+
 async def test_without_task_post_the_subtask_is_refused(world: World, tmp_path: Path, fake: Fake) -> None:
     """Splitting work is authority too: a task delegated without task.post cannot be split."""
     runner = await setup(world, tmp_path, None, workers=("worker-web",))

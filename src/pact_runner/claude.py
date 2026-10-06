@@ -100,6 +100,18 @@ WORKERS = """To split off work that can run on its own, post a subtask: pact_pos
 
 NO_WORKERS = "You have no sub-agents: do the work yourself and never end with status waiting."
 
+OWNER_CONTEXT = """## The owner's instructions (CLAUDE.md)
+
+These are the CLAUDE.md files of the person this machine belongs to, the same ones an interactive
+Claude Code session would load. Follow them in this task: commit messages, PR text, language,
+checks. Where they assume a person is answering you, or conflict with the rules above, the rules
+above win.
+
+"""
+
+CONTEXT_CAP = 20_000
+"""Characters taken from each CLAUDE.md, so a runaway file cannot eat the turn budget."""
+
 _QUOTA_TEXT = re.compile(
     r"usage limit|rate limit|hit your limit|limit reached|5-hour limit|weekly limit|out of extra usage|"
     r"\b429\b|overloaded",
@@ -141,6 +153,23 @@ class Outcome:
         return self.is_error and "no conversation found" in (self.text + self.stderr).lower()
 
 
+def owner_context(files: tuple[Path, ...]) -> str:
+    """The owner's CLAUDE.md files as one section, read fresh for each run so an edit applies to the
+    next task. A file that is missing or unreadable is left out; so is everything past the cap."""
+    parts: list[str] = []
+    for path in files:
+        try:
+            text = path.read_text().strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not text:
+            continue
+        if len(text) > CONTEXT_CAP:
+            text = text[:CONTEXT_CAP] + "\n[… cut: the file is longer than the Runner passes on]"
+        parts.append(f"### {path}\n\n{text}")
+    return OWNER_CONTEXT + "\n\n".join(parts) if parts else ""
+
+
 def role_prompt(cfg: RunnerConfig, task_id: str, branch: str, mandate_id: str = "", project_id: str = "") -> str:
     extra = cfg.role_file.read_text() if cfg.role_file else ""
     workers = (
@@ -148,7 +177,8 @@ def role_prompt(cfg: RunnerConfig, task_id: str, branch: str, mandate_id: str = 
         if cfg.workers
         else NO_WORKERS
     )
-    return ROLE.format(agent=cfg.agent_id, branch=branch, workers=workers) + ("\n" + extra if extra else "")
+    sections = [ROLE.format(agent=cfg.agent_id, branch=branch, workers=workers), owner_context(cfg.context_files), extra]
+    return "\n".join(s for s in sections if s)
 
 
 def settings(cfg: RunnerConfig) -> dict[str, Any]:
