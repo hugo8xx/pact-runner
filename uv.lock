@@ -620,7 +620,7 @@ wheels = [
 [[package]]
 name = "pact-board"
 version = "0.1.0"
-source = { git = "https://github.com/hugo8xx/pact-board?rev=22df3cf5a74f1a339f81c4db4b5c2b605c2dc12d#22df3cf5a74f1a339f81c4db4b5c2b605c2dc12d" }
+source = { git = "https://github.com/hugo8xx/pact-board?rev=c78cab8c20ac687338c1c6d90efd12432263455a#c78cab8c20ac687338c1c6d90efd12432263455a" }
 dependencies = [
     { name = "biscuit-python" },
     { name = "httpx" },
@@ -659,7 +659,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "mypy", specifier = ">=2.3.1" },
-    { name = "pact-board", git = "https://github.com/hugo8xx/pact-board?rev=22df3cf5a74f1a339f81c4db4b5c2b605c2dc12d" },
+    { name = "pact-board", git = "https://github.com/hugo8xx/pact-board?rev=c78cab8c20ac687338c1c6d90efd12432263455a" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.16.9" },
 ]

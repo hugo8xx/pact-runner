@@ -29,7 +29,7 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.9",
     # The tests run the Runner against a real board in-process. Pinned to a commit; bump it on purpose.
-    "pact-board @ git+https://github.com/hugo8xx/pact-board@22df3cf5a74f1a339f81c4db4b5c2b605c2dc12d",
+    "pact-board @ git+https://github.com/hugo8xx/pact-board@c78cab8c20ac687338c1c6d90efd12432263455a",
 ]
 
 [tool.ruff]
