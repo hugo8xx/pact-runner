@@ -16,11 +16,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from pact.board import Agent, Board
 from pact.db import fetchall, transaction
 from pact.errors import PactError
 from pact.scope import board_scope
+
 from pact_runner import worktree
 from pact_runner.board import BoardRefusal
 from pact_runner.config import RunnerConfig

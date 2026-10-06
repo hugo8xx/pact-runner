@@ -7,12 +7,9 @@ from typing import Any
 
 import psycopg
 import pytest
-
 from pact.admin import Admin
 from pact.board import Agent, Board, get_agent
 from pact.db import create_pool, migrate, transaction
-
-from .oauth_fixtures import board, issuer  # noqa: F401 — fixtures shared by the OAuth tests
 
 
 def _load_env(path: Path) -> None:

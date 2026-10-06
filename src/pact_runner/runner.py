@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -18,8 +19,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from pact.handoff import has_handoff
-
 from . import worktree
 from .board import FATAL, BoardClient, BoardRefusal
 from .claude import Outcome, Run, execute, role_prompt
@@ -27,6 +26,14 @@ from .config import RunnerConfig
 from .store import Session, Store, Waiting
 
 log = logging.getLogger("pact_runner")
+
+_HANDOFF = re.compile(r"^\s{0,3}#{1,6}\s*handoff\b", re.IGNORECASE | re.MULTILINE)
+
+
+def has_handoff(result: str) -> bool:
+    """Whether the result has the "Handoff" section the board needs to close a task."""
+    return bool(_HANDOFF.search(result))
+
 
 TERMINAL = frozenset({"completed", "failed", "canceled", "rejected"})
 

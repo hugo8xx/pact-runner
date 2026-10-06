@@ -1,0 +1,31 @@
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: pact
+          POSTGRES_PASSWORD: pact # leak-ok: a throwaway CI database
+          POSTGRES_DB: pact_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U pact" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://pact:pact@localhost:5432/pact_test # leak-ok: a throwaway CI database
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - run: uv sync --locked
+      - run: git config --global user.email ci@example.com && git config --global user.name CI
+      - run: uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest

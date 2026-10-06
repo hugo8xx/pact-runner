@@ -15,7 +15,7 @@
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>set -a; . /Users/you/.config/pact/runner-myproject.env; exec /Users/you/pact-board/.venv/bin/pact-runner</string>
+    <string>set -a; . /Users/you/.config/pact/runner-myproject.env; exec /Users/you/.local/bin/pact-runner</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
