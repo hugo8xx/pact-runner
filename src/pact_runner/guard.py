@@ -1,16 +1,21 @@
 """PreToolUse guard for Runner sessions: no pushing to protected branches, no force pushes, no
-merging PRs. Claude Code runs it before every Bash call; exit code 2 blocks the call and the reason
-on stderr goes back to the model.
+merging PRs, and nothing that looks like a leak (see ``leaks``) in what a push or a ``gh`` write
+would publish. Claude Code runs it before every Bash call; exit code 2 blocks the call and the
+reason on stderr goes back to the model.
 
 The allowlist decides which commands may run at all; this catches the dangerous forms of the
 commands the allowlist lets through. Branch protection on the host is still the hard stop.
 """
 
+import argparse
 import json
 import re
 import shlex
 import subprocess
 import sys
+from pathlib import Path
+
+from . import leaks
 
 PROTECTED = ("main", "master", "stage", "staging", "release")
 
@@ -68,6 +73,60 @@ def refusal(command: str, current_branch: str | None = None) -> str | None:
     return None
 
 
+GH_WRITES = {"pr", "issue", "release", "gist"}
+
+
+def _push_sources(args: list[str]) -> list[str]:
+    """What ``git push <args>`` sends: the source side of each refspec, HEAD when none is given."""
+    refs = [a for a in args[1:] if not a.startswith("-")][1:]
+    sources = [r.split(":", 1)[0].removeprefix("+") for r in refs]
+    return [s for s in sources if s] if refs else ["HEAD"]
+
+
+def _git_dir(words: list[str], cwd: str | None) -> str | None:
+    if "-C" in words and words.index("-C") + 1 < len(words):
+        return str(Path(cwd or ".") / words[words.index("-C") + 1])
+    return cwd
+
+
+def leak_refusal(command: str, cwd: str | None, deny: list[str], home: str | None = None) -> str | None:
+    """Why ``command`` would publish something it must not, or None. Before a push this reads the
+    outgoing commits; before ``gh pr|issue|release|gist`` it reads the command and any body file."""
+    home = home if home is not None else str(Path.home())
+    found: list[leaks.Leak] = []
+    for words in _words(command):
+        args = _git_args(words)
+        if args and args[0] == "push":
+            try:
+                commits = leaks.outgoing(_git_dir(words, cwd), _push_sources(args))
+            except (OSError, subprocess.SubprocessError) as err:
+                return f"Could not read the commits this push would send, so it is refused: {err}"
+            for sha, text in commits:
+                found += leaks.scan(text, f"commit {sha}", deny, home)
+        elif len(words) >= 2 and words[0] == "gh" and words[1] in GH_WRITES:
+            # The text a person will read. Paths the command only works in (cd targets, the
+            # worktree, the body file) are not published, so they are left out.
+            text = command
+            paths = [cwd or ""] + [w[i + 1] for w in _words(command) for i in range(len(w) - 1) if w[i] == "cd"]
+            bodies = [words[i + 1] for i in range(len(words) - 1) if words[i] in ("-F", "--body-file")]
+            for path in sorted(filter(None, paths + bodies), key=len, reverse=True):
+                text = text.replace(path, "")
+            for body in bodies:
+                try:
+                    text += "\n" + (Path(cwd or ".") / body).read_text()
+                except OSError:
+                    pass
+            found += leaks.scan(text, f"the gh {words[1]} text", deny, home)
+    if not found:
+        return None
+    listed = "; ".join(str(leak) for leak in dict.fromkeys(found))
+    return (
+        f"This would publish something that must stay private: {listed}. Remove it (rewrite the commit "
+        f"if it is already committed) and try again. Use placeholders instead. If a line holds an "
+        f"obviously fake test value, mark that line with `{leaks.ALLOW_MARK}`."
+    )
+
+
 def _branch(cwd: str | None) -> str | None:
     try:
         out = subprocess.run(
@@ -79,6 +138,9 @@ def _branch(cwd: str | None) -> str | None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(prog="pact-runner-guard")
+    parser.add_argument("--deny-file", type=Path, help="words that must never be published, one per line")
+    opts = parser.parse_args()
     try:
         event = json.load(sys.stdin)
     except ValueError:
@@ -86,7 +148,9 @@ def main() -> None:
         sys.exit(2)
     if event.get("tool_name") != "Bash":
         return
-    reason = refusal(str((event.get("tool_input") or {}).get("command", "")), _branch(event.get("cwd")))
+    command = str((event.get("tool_input") or {}).get("command", ""))
+    cwd = event.get("cwd")
+    reason = refusal(command, _branch(cwd)) or leak_refusal(command, cwd, leaks.deny_words(opts.deny_file))
     if reason:
         print(reason, file=sys.stderr)
         sys.exit(2)
