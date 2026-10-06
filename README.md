@@ -31,6 +31,8 @@ It posts the code to the board's `POST /connect` and gets the token back once. I
 token; it writes it straight into place:
 
 - Claude Code: the `pact` MCP server for the project directory, plus the hooks env file.
+- Gemini CLI: the `pact` MCP server in `~/.gemini/settings.json` (user level, mode 600, everything
+  else in the file kept). Not a project's `.gemini/settings.json`, which could be committed.
 - Runner: its env file (mode 600) and role instructions, a clone (`--repo`), and on macOS a
   LaunchAgent whose `PATH` holds the `claude`, `uv`, `gh` and `git` found on that machine.
 

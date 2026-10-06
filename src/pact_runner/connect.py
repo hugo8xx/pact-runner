@@ -5,12 +5,15 @@ writes it straight into the agent's config, so the token is never shown or paste
 
 - Claude Code (client ``code``): adds the board as an MCP server for the project directory and
   writes the hooks env file.
+- Gemini CLI (client ``gemini``): adds the board as an MCP server to ``~/.gemini/settings.json``
+  (outside any repository, mode 600), keeping everything else in that file.
 - Runner (client ``runner``): writes the runner's env file (role settings, role instructions), clones
   its repository if asked, and on macOS installs and starts a LaunchAgent whose PATH holds the tools
   it needs (claude, uv, gh, git) as found on this machine.
 """
 
 import argparse
+import json
 import os
 import plistlib
 import shlex
@@ -27,6 +30,7 @@ LOGS = Path.home() / "Library" / "Logs"
 AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 REPOS = Path.home() / "pact-runner" / "repos"
 TOOLS = ("claude", "uv", "gh", "git", "pact-runner")
+GEMINI_SETTINGS = Path.home() / ".gemini" / "settings.json"
 
 
 def redeem(board: str, code: str, client: httpx.Client | None = None) -> dict[str, Any]:
@@ -81,6 +85,36 @@ def connect_code(info: dict[str, Any], project_dir: Path, mcp_name: str, config:
     else:
         done.append("claude not found: add the MCP server yourself; the token is in the hooks env file")
     return done
+
+
+def connect_gemini(info: dict[str, Any], mcp_name: str, config: Path = CONFIG, settings: Path | None = None) -> list[str]:
+    """Gemini CLI reads MCP servers from settings.json. The user-level file is used rather than a
+    project's ``.gemini/settings.json``, which lives in the repository and could be committed."""
+    settings = settings or GEMINI_SETTINGS
+    agent = info["agent_id"]
+    current: dict[str, Any] = {}
+    if settings.exists():
+        try:
+            current = json.loads(settings.read_text() or "{}")
+        except ValueError as err:
+            raise SystemExit(
+                f"pact-connect: {settings} is not plain JSON ({err}); fix it or add the server yourself. The code is used up."
+            ) from err
+        if not isinstance(current, dict):
+            raise SystemExit(f"pact-connect: {settings} does not hold a JSON object. The code is used up.")
+    servers = current.setdefault("mcpServers", {})
+    servers[mcp_name] = {
+        "httpUrl": info["mcp_url"],
+        "headers": {"Authorization": f"Bearer {info['token']}"},
+        "trust": False,
+    }
+    write_secret(settings, json.dumps(current, indent=2) + "\n")
+    env = config / f"{agent}.env"
+    write_secret(env, env_lines({"PACT_URL": info["board_url"], "PACT_TOKEN": info["token"]}))
+    return [
+        f"Gemini CLI MCP server '{mcp_name}' in {settings} (restart gemini to load it; /mcp lists it)",
+        f"hooks env: {env}",
+    ]
 
 
 def runner_env(info: dict[str, Any], repo: Path | None, role_file: Path | None) -> dict[str, str]:
@@ -177,7 +211,7 @@ def main() -> None:
     p.add_argument("board", help="the board URL shown with the setup code")
     p.add_argument("code", help="the one-time setup code (pcs_...)")
     p.add_argument("--dir", default=".", help="Claude Code: the project directory to add the MCP server to")
-    p.add_argument("--mcp-name", default="pact", help="Claude Code: the MCP server name (default: pact)")
+    p.add_argument("--mcp-name", default="pact", help="Claude Code and Gemini CLI: the MCP server name (default: pact)")
     p.add_argument("--repo", help="Runner: a local clone, or a git URL to clone for it")
     p.add_argument("--no-launch", action="store_true", help="Runner: write the LaunchAgent but do not start it")
     p.add_argument("--force", action="store_true", help="overwrite an existing env file for this agent")
@@ -190,6 +224,8 @@ def main() -> None:
     print(f"connected as {info['agent_id']} ({info['client']}, project {info['project']})")
     if info["client"] == "runner":
         steps = connect_runner(info, args.repo, not args.no_launch)
+    elif info["client"] == "gemini":
+        steps = connect_gemini(info, args.mcp_name)
     else:
         steps = connect_code(info, Path(args.dir).resolve(), args.mcp_name)
     for step in steps:
