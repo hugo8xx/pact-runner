@@ -18,13 +18,19 @@ from pathlib import Path
 from . import leaks
 
 PROTECTED = ("main", "master", "stage", "staging", "release")
+GH_WRITES = {"pr", "issue", "release", "gist"}
+BODY_FILE_FLAGS = ("-F", "--body-file", "--notes-file")
+WRAPPERS = {"eval", "sh", "bash", "zsh", "dash", "xargs", "exec", "env", "nohup", "timeout", "command", "builtin", "time", "sudo"}
+"""Commands that run another command the guard would not see as itself."""
+_HIDDEN_PUBLISH = re.compile(r"\bgit\b.*\bpush\b|\bgh\s+(?:pr|issue|release|gist|api)\b", re.S)
 
 
 def _words(command: str) -> list[list[str]]:
-    """Split a shell line into simple commands on ;, &&, || and |. Unparseable lines come back
-    as one raw command so they are judged rather than skipped."""
+    """Split a shell line into simple commands on ;, &&, ||, |, &, newlines, subshell parentheses
+    and backticks. Unparseable lines come back as one raw command so they are judged rather than
+    skipped."""
     out: list[list[str]] = []
-    for part in re.split(r"&&|\|\||;|\||\n", command):
+    for part in re.split(r"&&|\|\||;|\||\n|&|\(|\)|`", command):
         try:
             words = shlex.split(part)
         except ValueError:
@@ -34,11 +40,18 @@ def _words(command: str) -> list[list[str]]:
     return out
 
 
-def _git_args(words: list[str]) -> list[str] | None:
-    """The arguments after ``git``, skipping env assignments and git's own options (``-C dir``)."""
+def _strip_env(words: list[str]) -> list[str]:
+    """The command without leading ``NAME=value`` assignments."""
     i = 0
     while i < len(words) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[i]):
         i += 1
+    return words[i:]
+
+
+def _git_args(words: list[str]) -> list[str] | None:
+    """The arguments after ``git``, skipping env assignments and git's own options (``-C dir``)."""
+    words = _strip_env(words)
+    i = 0
     if i >= len(words) or words[i].rsplit("/", 1)[-1] != "git":
         return None
     i += 1
@@ -47,33 +60,83 @@ def _git_args(words: list[str]) -> list[str] | None:
     return words[i:]
 
 
+def _gh_write(words: list[str]) -> bool:
+    """``gh pr|issue|release|gist …``: a command that publishes text."""
+    words = _strip_env(words)
+    return len(words) >= 2 and words[0] == "gh" and words[1] in GH_WRITES
+
+
+def _is_push(words: list[str]) -> bool:
+    args = _git_args(words)
+    return args is not None and args[:1] == ["push"]
+
+
+def _api_writes(args: list[str]) -> bool:
+    """Whether ``gh api <args>`` changes something: a method other than GET, or fields (which make
+    it a POST)."""
+    for i, a in enumerate(args):
+        method = None
+        if a in ("-X", "--method") and i + 1 < len(args):
+            method = args[i + 1]
+        elif a.startswith("--method="):
+            method = a.split("=", 1)[1]
+        elif a.startswith("-X") and len(a) > 2:
+            method = a[2:]
+        if method is not None and method.upper() != "GET":
+            return True
+        if a in ("-f", "-F", "--field", "--raw-field", "--input") or a.startswith(("--field=", "--raw-field=", "--input=")):
+            return True
+    return False
+
+
+def _short_flags(opts: list[str]) -> str:
+    """The letters of single-dash options, so ``-uf`` counts as ``-u -f``."""
+    return "".join(o[1:] for o in opts if o.startswith("-") and not o.startswith("--"))
+
+
 def refusal(command: str, current_branch: str | None = None) -> str | None:
     """Why ``command`` must not run, or None. ``current_branch`` is what a push without a target
     (``git push``, ``git push origin HEAD``) would push."""
-    for words in _words(command):
-        if len(words) >= 3 and words[0] == "gh" and words[1] == "pr" and words[2] == "merge":
+    commands = _words(command)
+    publishing = [w for w in commands if _is_push(w) or _gh_write(w)]
+    others = [w for w in commands if w not in publishing and _strip_env(w)[:1] != ["cd"]]
+    if publishing and others:
+        # The guard reads what will be published before anything in the line runs, so a commit or a
+        # body file made earlier in the same line would not be read.
+        return (
+            "Run git push and gh pr/issue/release/gist writes in a Bash call of their own (a leading cd is fine), "
+            "after the commit or the body file exists, so the guard can read what they publish."
+        )
+    for words in commands:
+        bare = _strip_env(words)
+        if bare and bare[0].rsplit("/", 1)[-1] in WRAPPERS and _HIDDEN_PUBLISH.search(" ".join(bare[1:])):
+            return "Run git push and gh writes directly, not through eval, sh -c, xargs or a similar wrapper."
+        if len(bare) >= 3 and bare[0] == "gh" and bare[1] == "pr" and bare[2] == "merge":
             return "Runner sessions never merge pull requests; a person merges."
+        if bare[:2] == ["gh", "api"] and _api_writes(bare[2:]):
+            return "Runner sessions never write through gh api; use gh pr create and push a branch."
+        if bare[:1] == ["git"] and any(v.startswith("alias.") for v in bare[1:]):
+            return "Runner sessions never define git aliases."
         args = _git_args(words)
         if not args or args[0] != "push":
             continue
         opts = [a for a in args[1:] if a.startswith("-")]
-        if any(o in ("-f", "--force", "--force-with-lease", "--mirror", "--all") or o.startswith("--force") for o in opts):
+        if any(
+            o in ("--force", "--force-with-lease", "--mirror", "--all") or o.startswith("--force") for o in opts
+        ) or "f" in _short_flags(opts):
             return "Runner sessions never force-push or push every branch."
         if any(o.startswith("+") for o in args[1:]):
             return "Runner sessions never force-push (a + refspec)."
         refs = [a for a in args[1:] if not a.startswith("-")][1:]
+        if "--delete" in opts or "d" in _short_flags(opts) or any(r.startswith(":") for r in refs):
+            return "Runner sessions never delete remote branches."
         targets = [r.split(":", 1)[-1].removeprefix("refs/heads/") for r in refs] or ["HEAD"]
         for target in targets:
             if target == "HEAD":
                 target = current_branch or ""
             if target in PROTECTED:
                 return f"Runner sessions never push to {target}; push a feature branch and open a PR."
-        if "--delete" in opts or "-d" in opts:
-            return "Runner sessions never delete remote branches."
     return None
-
-
-GH_WRITES = {"pr", "issue", "release", "gist"}
 
 
 def _push_sources(args: list[str]) -> list[str]:
@@ -103,27 +166,42 @@ def leak_refusal(command: str, cwd: str | None, deny: list[str], home: str | Non
                 return f"Could not read the commits this push would send, so it is refused: {err}"
             for sha, text in commits:
                 found += leaks.scan(text, f"commit {sha}", deny, home)
-        elif len(words) >= 2 and words[0] == "gh" and words[1] in GH_WRITES:
-            # The text a person will read. Paths the command only works in (cd targets, the
-            # worktree, the body file) are not published, so they are left out.
-            text = command
-            paths = [cwd or ""] + [w[i + 1] for w in _words(command) for i in range(len(w) - 1) if w[i] == "cd"]
-            bodies = [words[i + 1] for i in range(len(words) - 1) if words[i] in ("-F", "--body-file")]
-            for path in sorted(filter(None, paths + bodies), key=len, reverse=True):
-                text = text.replace(path, "")
-            for body in bodies:
+        elif _gh_write(words):
+            bare = _strip_env(words)
+            files: list[str] = []
+            published: list[str] = []
+            skip = False
+            for i, w in enumerate(bare):
+                if skip:
+                    skip = False
+                    continue
+                if w in BODY_FILE_FLAGS:
+                    files.append(bare[i + 1] if i + 1 < len(bare) else "-")
+                    skip = True
+                elif any(w.startswith(f + "=") for f in BODY_FILE_FLAGS if f.startswith("--")):
+                    files.append(w.split("=", 1)[1])
+                elif w.startswith("-F") and len(w) > 2:
+                    files.append(w[2:])
+                elif w.startswith("<"):
+                    return "Pass a gh body with --body or --body-file, not on stdin, so the guard can read it."
+                else:
+                    published.append(w)
+            text = leaks.without_mark("\n".join(published))
+            for body in files:
+                if body == "-":
+                    return "Pass a gh body with --body or --body-file, not on stdin, so the guard can read it."
                 try:
-                    text += "\n" + (Path(cwd or ".") / body).read_text()
-                except OSError:
-                    pass
-            found += leaks.scan(text, f"the gh {words[1]} text", deny, home)
+                    text += "\n" + leaks.without_mark((Path(cwd or ".") / body).read_text())
+                except OSError as err:
+                    return f"Could not read the body file {body}, so this is refused: {err}"
+            found += leaks.scan(text, f"the gh {bare[1]} text", deny, home)
     if not found:
         return None
     listed = "; ".join(str(leak) for leak in dict.fromkeys(found))
     return (
         f"This would publish something that must stay private: {listed}. Remove it (rewrite the commit "
-        f"if it is already committed) and try again. Use placeholders instead. If a line holds an "
-        f"obviously fake test value, mark that line with `{leaks.ALLOW_MARK}`."
+        f"if it is already committed) and try again with placeholders. Never mark real values to get "
+        f"past this; `{leaks.ALLOW_MARK}` only counts on an obviously fake value inside a test file."
     )
 
 
