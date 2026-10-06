@@ -31,8 +31,11 @@ It posts the code to the board's `POST /connect` and gets the token back once. I
 token; it writes it straight into place:
 
 - Claude Code: the `pact` MCP server for the project directory, plus the hooks env file.
-- Gemini CLI: the `pact` MCP server in `~/.gemini/settings.json` (user level, mode 600, everything
-  else in the file kept). Not a project's `.gemini/settings.json`, which could be committed.
+- Gemini: the `pact` MCP server in Antigravity CLI's `~/.gemini/config/mcp_config.json`
+  (`serverUrl` plus a bearer header). Antigravity CLI (`agy`) replaced Gemini CLI for people who
+  sign in with a Google account. `--gemini-cli` also adds it to Gemini CLI's `~/.gemini/settings.json`,
+  for those still on Gemini CLI with an API key. Only user-level files are written, mode 600, and
+  everything else in them is kept. A project's config lives in the repo and could get committed.
 - Runner: its env file (mode 600) and role instructions, a clone (`--repo`), and on macOS a
   LaunchAgent whose `PATH` holds the `claude`, `uv`, `gh` and `git` found on that machine.
 

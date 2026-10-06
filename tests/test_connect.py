@@ -71,29 +71,40 @@ def test_a_runner_prompt_shows_the_budget_left() -> None:
     assert "runs 2, turns 40" in prompt
 
 
-def test_pact_connect_adds_the_board_to_gemini_and_keeps_the_rest(tmp_path: Path) -> None:
-    settings = tmp_path / ".gemini" / "settings.json"
-    settings.parent.mkdir()
-    settings.write_text(json.dumps({"theme": "Dracula", "mcpServers": {"other": {"command": "x"}}}))
+def test_pact_connect_adds_the_board_to_antigravity_and_keeps_the_rest(tmp_path: Path) -> None:
+    agy = tmp_path / ".gemini" / "config" / "mcp_config.json"
+    agy.parent.mkdir(parents=True)
+    agy.write_text(json.dumps({"mcpServers": {"other": {"command": "x"}}, "x": 1}))
+    legacy = tmp_path / ".gemini" / "settings.json"
     info = _info(agent_id="gemini-web", client="gemini", mcp_url="https://board.example/mcp/a/gemini-web")
-    steps = connect.connect_gemini(info, "pact", config=tmp_path / "config", settings=settings)
-    data = json.loads(settings.read_text())
-    assert data["theme"] == "Dracula" and data["mcpServers"]["other"] == {"command": "x"}
+    steps = connect.connect_gemini(info, "pact", config=tmp_path / "config", antigravity=agy, gemini_cli=legacy)
+    data = json.loads(agy.read_text())
+    assert data["x"] == 1 and data["mcpServers"]["other"] == {"command": "x"}
     assert data["mcpServers"]["pact"] == {
-        "httpUrl": "https://board.example/mcp/a/gemini-web",
+        "serverUrl": "https://board.example/mcp/a/gemini-web",
         "headers": {"Authorization": "Bearer pact_secret"},
-        "trust": False,
+        "disabled": False,
     }
-    assert settings.stat().st_mode & 0o777 == 0o600 and (tmp_path / "config" / "gemini-web.env").exists()
-    assert any("restart gemini" in s for s in steps)
+    assert agy.stat().st_mode & 0o777 == 0o600 and (tmp_path / "config" / "gemini-web.env").exists()
+    assert not legacy.exists() and any("agy" in s for s in steps)  # Gemini CLI only when asked
 
 
-def test_pact_connect_creates_gemini_settings_and_refuses_a_broken_file(tmp_path: Path) -> None:
-    settings = tmp_path / "new" / "settings.json"
-    info = _info(client="gemini")
-    connect.connect_gemini(info, "board", config=tmp_path / "config", settings=settings)
-    assert "board" in json.loads(settings.read_text())["mcpServers"]
-    settings.write_text("{ // a comment\n}")
+def test_pact_connect_configures_gemini_cli_when_asked(tmp_path: Path) -> None:
+    agy, legacy = tmp_path / "agy.json", tmp_path / "settings.json"
+    legacy.write_text(json.dumps({"theme": "Dracula"}))
+    connect.connect_gemini(
+        _info(client="gemini"), "board", config=tmp_path / "c", antigravity=agy, gemini_cli=legacy, legacy=True
+    )
+    data = json.loads(legacy.read_text())
+    assert data["theme"] == "Dracula" and data["mcpServers"]["board"]["httpUrl"] == "https://board.example/mcp/a/runner-web"
+    assert "board" in json.loads(agy.read_text())["mcpServers"]
+
+
+def test_pact_connect_leaves_a_broken_config_alone(tmp_path: Path) -> None:
+    agy = tmp_path / "mcp_config.json"
+    agy.write_text("{ // a comment\n}")
     with pytest.raises(SystemExit, match="not plain JSON"):
-        connect.connect_gemini(info, "board", config=tmp_path / "config", settings=settings)
-    assert settings.read_text().startswith("{ //")  # left as it was
+        connect.connect_gemini(
+            _info(client="gemini"), "pact", config=tmp_path / "c", antigravity=agy, gemini_cli=tmp_path / "s.json"
+        )
+    assert agy.read_text().startswith("{ //")
