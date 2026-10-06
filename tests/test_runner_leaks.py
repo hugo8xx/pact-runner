@@ -13,7 +13,7 @@ import pytest
 from pact_runner import leaks
 from pact_runner.claude import guard_command
 from pact_runner.config import RunnerConfig
-from pact_runner.guard import leak_refusal
+from pact_runner.guard import leak_refusal, refusal
 
 KEY = "sk-" + "ant-" + "A1b2" * 6
 HOME = "/Users/someone"
@@ -131,3 +131,131 @@ def test_the_hook_reads_the_deny_file(clone: Path, tmp_path: Path) -> None:
         text=True,
     )
     assert run.returncode == 2 and "board.internal.example" in run.stderr
+
+
+# ── findings of the outside review (gemini-pact, 2026-10-06) ──────────────────
+
+
+def guarded(command: str, cwd: str, deny: list[str] | None = None) -> str | None:
+    return refusal(command, "runner/t1") or leak_refusal(command, cwd, deny or [], HOME)
+
+
+def test_a_push_must_run_on_its_own(clone: Path) -> None:
+    """The guard reads the outgoing commits before the line runs, so a commit made earlier in the
+    same line would slip past it."""
+    assert guarded(f'git commit --allow-empty -m "{KEY}" && git push origin runner/t1', str(clone))
+    assert guarded("git add . && git commit -m x; git push", str(clone))
+    assert guarded("echo body > pr.md && gh pr create --title t --body-file pr.md", str(clone))
+    assert guarded("cd somewhere && git push -u origin runner/t1", str(clone)) is None  # a leading cd is fine
+    assert guarded("git status && git log --oneline -3", str(clone)) is None  # no push, nothing to read
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(git push origin main)",
+        "git push origin main &",
+        "echo `git push origin main`",
+        'eval "git push origin main"',
+        'sh -c "git push origin main"',
+        "echo origin main | xargs git push",
+        'env X=1 bash -c "gh pr create --title t --body x"',
+        'git -c alias.sp="push origin main" sp',
+        "gh api -X PUT repos/o/r/pulls/1/merge",
+        "gh api --method=DELETE repos/o/r/git/refs/heads/x",
+        "gh api repos/o/r/issues/1/comments -f body=hello",
+        "git push origin :runner/t1",
+        "git push -uf origin runner/t1",
+        "git push -ud origin runner/t1",
+    ],
+)
+def test_ways_around_the_guard_are_refused(command: str) -> None:
+    assert refusal(command, "runner/t1")
+
+
+@pytest.mark.parametrize("command", ["gh api repos/o/r/pulls/1", "gh api -X GET repos/o/r", "git push -u origin runner/t1"])
+def test_harmless_forms_still_run(command: str) -> None:
+    assert refusal(command, "runner/t1") is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create --title t --body-file=pr.md",
+        "gh pr create --title t -Fpr.md",
+        "gh pr create --title t -F pr.md",
+        "GH_X=1 gh pr create --title t --body-file pr.md",
+        "gh release create v1 --notes-file pr.md",
+    ],
+)
+def test_every_way_of_naming_a_body_file_is_read(clone: Path, command: str) -> None:
+    (clone / "pr.md").write_text(f"deployed with {KEY}\n")
+    assert leak_refusal(command, str(clone), [], HOME)
+    (clone / "pr.md").write_text("all checks pass\n")
+    assert leak_refusal(command, str(clone), [], HOME) is None
+
+
+def test_a_body_on_stdin_or_a_missing_file_is_refused(clone: Path) -> None:
+    assert leak_refusal("gh pr create --title t < pr.md", str(clone), [], HOME)
+    assert leak_refusal("gh pr create --title t --body-file -", str(clone), [], HOME)
+    assert leak_refusal("gh pr create --title t --body-file nowhere.md", str(clone), [], HOME)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "key = AIza" + "SyD-1234567890123456789012345678901",
+        "redis://:" + "my_super_secret_pw@db:6379",
+        "-----BEGIN PGP PRIVATE " + "KEY BLOCK-----",
+    ],
+)
+def test_more_secrets_are_caught(line: str) -> None:
+    assert leaks.scan(line, "x", [], HOME)
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["def pact_board_environment_variable(): ...", 'class="sk-placeholder-skeleton-loader"', "DATABASE=pact_runner_split_test"],
+)
+def test_ordinary_names_are_not_secrets(line: str) -> None:
+    assert leaks.scan(line, "x", [], HOME) == []
+    assert leaks.scan("token: pact_" + "Ab3dE5" * 7, "x", [], HOME)  # a generated one still is
+
+
+def test_denied_words_match_whole_words() -> None:
+    assert leaks.scan("the channel is open", "x", ["Ann"], HOME) == []
+    assert leaks.scan("written by Ann Lee", "x", ["Ann"], HOME)
+    assert leaks.scan("see board.internal.example/x", "x", ["board.internal.example"], HOME)
+
+
+def test_leak_ok_counts_only_in_test_files(clone: Path) -> None:
+    (clone / "tests").mkdir()
+    (clone / "src").mkdir()
+    commit(clone, "tests/test_x.py", f'FAKE = "{KEY}"  # leak-ok\n')
+    assert leak_refusal("git push origin runner/t1", str(clone), [], HOME) is None
+    commit(clone, "src/app.py", f'KEY = "{KEY}"  # leak-ok\n')
+    assert leak_refusal("git push origin runner/t1", str(clone), [], HOME)
+
+
+def test_leak_ok_does_not_count_in_messages_or_pr_text(clone: Path) -> None:
+    commit(clone, "b.txt", "x\n", message=f"use {KEY} leak-ok")
+    assert leak_refusal("git push origin runner/t1", str(clone), [], HOME)
+    assert leak_refusal(f'gh pr comment 1 --body "{KEY} leak-ok"', str(clone), [], HOME)
+
+
+def test_the_home_path_is_found_in_pr_text_even_when_it_is_the_cwd(clone: Path) -> None:
+    assert leak_refusal(f'gh pr comment 1 --body "tested in {HOME}/wt/x"', f"{HOME}/wt", [], HOME)
+
+
+def test_merge_commits_and_plus_lines_are_read(clone: Path) -> None:
+    git(clone, "switch", "-qc", "side")
+    commit(clone, "s.txt", "side\n")
+    git(clone, "switch", "-q", "runner/t1")
+    commit(clone, "m.txt", "main side\n")
+    git(clone, "merge", "-q", "--no-ff", "--no-commit", "side")
+    (clone / "resolved.txt").write_text(f"{KEY}\n")
+    git(clone, "add", ".")
+    git(clone, "commit", "-qm", "merge side")
+    assert leak_refusal("git push origin runner/t1", str(clone), [], HOME)  # a secret added in the merge itself
+    commit(clone, "c.txt", "++counter;\n")
+    assert "++counter;" in "\n".join(t for _, t in leaks.outgoing(str(clone), ["runner/t1"]))

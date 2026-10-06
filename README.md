@@ -62,8 +62,12 @@ One process per runner agent, on a machine that has a logged-in `claude`:
      outgoing commit (message and added lines) and the PR or comment text, including a body file.
      It refuses secrets (API keys, tokens, private keys, passwords in URLs), this machine's home path
      and any word in `PACT_RUNNER_DENY_FILE` (one per line: real hosts, names, emails). On a public
-     repository these would be public for good. A line with an obviously fake test value can carry
-     `leak-ok`.
+     repository these would be public for good. `leak-ok` on a line marks an obviously fake test value,
+     and counts only inside test files.
+   - `git push` and those `gh` writes must run in a Bash call of their own (a leading `cd` is fine).
+     The guard reads what they publish before the line runs, so a commit or body file made earlier
+     in the same line would slip past. A body on stdin is refused. The guard also refuses `eval`,
+     `sh -c`, `xargs` and similar wrappers around them, `gh api` writes and git aliases.
    - The board as an MCP server, minus `pact_claim`/`pact_report`/`pact_defer`/`pact_revoke`. The session
      answers through `--json-schema` structured output (`completed`, `failed`, `input_required` or
      `defer`), and the Runner reports for it with `usage={"turns": n}`.

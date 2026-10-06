@@ -81,6 +81,8 @@ answer a question mid-run. You work on exactly one board task, in the git worktr
 Rules:
 - Stay inside the task. Commit to your branch and push it; open a PR with `gh pr create` when there is
   code to review. Never push to main or another protected branch, never force-push, never merge.
+- Run `git push` and `gh pr create` each in a Bash call of its own, after the commit exists; give the
+  PR text with --body or --body-file, not a heredoc or stdin. A guard reads what they would publish.
 - Read the project's notes with pact_note before you start, and follow the repository's own checks.
 - {workers}
 - You cannot claim or close tasks yourself. End by returning the structured result:
