@@ -1,0 +1,2 @@
+# Reviewed 2026-10-06: a test fixture, not a secret (the test signing key in tests/conftest.py).
+bb2ba1e6c125d7a06c643322c698aaeaa6213c33:tests/conftest.py:generic-api-key:27
