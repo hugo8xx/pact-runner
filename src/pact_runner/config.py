@@ -50,6 +50,10 @@ DISALLOWED_TOOLS = (
 """The Runner alone claims and closes tasks; the session hands its answer back as structured output."""
 
 
+DEFAULT_CONTEXT_FILES = ("~/.claude/CLAUDE.md",)
+"""What ``claude`` would load from the user's own settings; ``PACT_RUNNER_CONTEXT_FILES=none`` turns it off."""
+
+
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
@@ -128,6 +132,9 @@ class RunnerConfig:
     claude: tuple[str, ...] = ("claude",)
     allowed_tools: tuple[str, ...] = DEFAULT_ALLOWED_TOOLS
     role_file: Path | None = None
+    context_files: tuple[Path, ...] = ()
+    """The owner's CLAUDE.md files, put into every new session's role. The session loads only project
+    settings, so it would never see them otherwise. Missing files are skipped."""
     entry_hook: str | None = None
     """Shell command for a PostToolUse hook that logs entries to the board (hooks/pact-hook.sh)."""
     guard: tuple[str, ...] = field(default_factory=lambda: (sys.executable, "-m", "pact_runner.guard"))
@@ -153,6 +160,7 @@ class RunnerConfig:
         state = Path(_env("PACT_RUNNER_STATE_DIR") or Path.home() / ".local/state/pact-runner" / agent).expanduser()
         repo = _env("PACT_RUNNER_REPO")
         role = _env("PACT_RUNNER_ROLE_FILE")
+        context = _list("PACT_RUNNER_CONTEXT_FILES", DEFAULT_CONTEXT_FILES)
         return cls(
             board_url=url,
             agent_id=agent,
@@ -180,5 +188,6 @@ class RunnerConfig:
             claude=tuple(_env("PACT_RUNNER_CLAUDE", "claude").split()),
             allowed_tools=_list("PACT_RUNNER_ALLOWED_TOOLS", DEFAULT_ALLOWED_TOOLS),
             role_file=Path(role).expanduser() if role else None,
+            context_files=() if context == ("none",) else tuple(Path(f).expanduser() for f in context),
             entry_hook=_env("PACT_RUNNER_ENTRY_HOOK") or None,
         )

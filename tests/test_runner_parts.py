@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from pact_runner.claude import StreamReader, child_env
+from pact_runner.claude import CONTEXT_CAP, StreamReader, child_env, role_prompt
 from pact_runner.config import RunnerConfig
 from pact_runner.guard import refusal
 
@@ -134,6 +134,29 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     monkeypatch.setenv("PACT_RUNNER_QUIET_HOURS", "9-18")
     c = RunnerConfig.from_env()
     assert c.mcp_url == "https://board.example/mcp/a/runner-web" and c.quiet_hours == (9, 18) and c.max_turns == 40
+    assert c.context_files == (Path.home() / ".claude/CLAUDE.md",)  # what claude itself would load
+    monkeypatch.setenv("PACT_RUNNER_CONTEXT_FILES", "none")
+    assert RunnerConfig.from_env().context_files == ()
     monkeypatch.setenv("PACT_RUNNER_AUTH", "api_key")
     with pytest.raises(SystemExit):
         RunnerConfig.from_env()
+
+
+def test_the_role_carries_the_owners_claude_md(tmp_path: Path) -> None:
+    """The session loads only project settings, so the owner's CLAUDE.md reaches it through the role."""
+    rules = tmp_path / "CLAUDE.md"
+    rules.write_text("Never add an AI co-author trailer.")
+    role_file = tmp_path / "role.md"
+    role_file.write_text("You are the secretary.")
+    role = role_prompt(cfg(context_files=(rules, tmp_path / "missing.md"), role_file=role_file), "t1", "runner/t1")
+    assert "Never add an AI co-author trailer." in role and f"### {rules}" in role
+    assert "missing.md" not in role  # a file that is not there is skipped, not an error
+    assert role.index("The owner's instructions") < role.index("You are the secretary.")  # the role file comes last
+    assert "owner's instructions" not in role_prompt(cfg(), "t1", "runner/t1")
+
+
+def test_a_huge_claude_md_is_cut(tmp_path: Path) -> None:
+    rules = tmp_path / "CLAUDE.md"
+    rules.write_text("x" * (CONTEXT_CAP + 500))
+    role = role_prompt(cfg(context_files=(rules,)), "t1", "runner/t1")
+    assert "x" * CONTEXT_CAP in role and "x" * (CONTEXT_CAP + 1) not in role and "[… cut" in role
