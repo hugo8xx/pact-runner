@@ -5,8 +5,9 @@ writes it straight into the agent's config, so the token is never shown or paste
 
 - Claude Code (client ``code``): adds the board as an MCP server for the project directory and
   writes the hooks env file.
-- Gemini CLI (client ``gemini``): adds the board as an MCP server to ``~/.gemini/settings.json``
-  (outside any repository, mode 600), keeping everything else in that file.
+- Gemini (client ``gemini``): adds the board as an MCP server to Antigravity CLI's
+  ``~/.gemini/config/mcp_config.json`` (and with ``--gemini-cli`` to Gemini CLI's
+  ``~/.gemini/settings.json``), outside any repository, mode 600, keeping everything else.
 - Runner (client ``runner``): writes the runner's env file (role settings, role instructions), clones
   its repository if asked, and on macOS installs and starts a LaunchAgent whose PATH holds the tools
   it needs (claude, uv, gh, git) as found on this machine.
@@ -31,6 +32,7 @@ AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 REPOS = Path.home() / "pact-runner" / "repos"
 TOOLS = ("claude", "uv", "gh", "git", "pact-runner")
 GEMINI_SETTINGS = Path.home() / ".gemini" / "settings.json"
+ANTIGRAVITY_MCP = Path.home() / ".gemini" / "config" / "mcp_config.json"
 
 
 def redeem(board: str, code: str, client: httpx.Client | None = None) -> dict[str, Any]:
@@ -87,34 +89,49 @@ def connect_code(info: dict[str, Any], project_dir: Path, mcp_name: str, config:
     return done
 
 
-def connect_gemini(info: dict[str, Any], mcp_name: str, config: Path = CONFIG, settings: Path | None = None) -> list[str]:
-    """Gemini CLI reads MCP servers from settings.json. The user-level file is used rather than a
-    project's ``.gemini/settings.json``, which lives in the repository and could be committed."""
-    settings = settings or GEMINI_SETTINGS
-    agent = info["agent_id"]
+def _add_mcp_server(path: Path, name: str, entry: dict[str, Any]) -> None:
+    """Put one server into a JSON file's ``mcpServers``, keeping everything else in it. A file that
+    is not plain JSON is left alone rather than rewritten."""
     current: dict[str, Any] = {}
-    if settings.exists():
+    if path.exists():
         try:
-            current = json.loads(settings.read_text() or "{}")
+            current = json.loads(path.read_text() or "{}")
         except ValueError as err:
             raise SystemExit(
-                f"pact-connect: {settings} is not plain JSON ({err}); fix it or add the server yourself. The code is used up."
+                f"pact-connect: {path} is not plain JSON ({err}); fix it or add the server yourself. The code is used up."
             ) from err
         if not isinstance(current, dict):
-            raise SystemExit(f"pact-connect: {settings} does not hold a JSON object. The code is used up.")
-    servers = current.setdefault("mcpServers", {})
-    servers[mcp_name] = {
-        "httpUrl": info["mcp_url"],
-        "headers": {"Authorization": f"Bearer {info['token']}"},
-        "trust": False,
-    }
-    write_secret(settings, json.dumps(current, indent=2) + "\n")
+            raise SystemExit(f"pact-connect: {path} does not hold a JSON object. The code is used up.")
+    current.setdefault("mcpServers", {})[name] = entry
+    write_secret(path, json.dumps(current, indent=2) + "\n")
+
+
+def connect_gemini(
+    info: dict[str, Any],
+    mcp_name: str,
+    config: Path = CONFIG,
+    *,
+    antigravity: Path | None = None,
+    gemini_cli: Path | None = None,
+    legacy: bool = False,
+) -> list[str]:
+    """A ``gemini`` agent runs in Antigravity CLI (``agy``), which replaced Gemini CLI for people
+    signing in with a Google account. Its user-level MCP config gets the board (``serverUrl`` and a
+    bearer header). With ``legacy``, Gemini CLI's ``settings.json`` gets it too (``httpUrl``), for
+    people still on Gemini CLI with an API key. User-level files only: a project's config lives in
+    the repository and could be committed with the token in it."""
+    antigravity = antigravity or ANTIGRAVITY_MCP
+    gemini_cli = gemini_cli or GEMINI_SETTINGS
+    agent = info["agent_id"]
+    bearer = {"Authorization": f"Bearer {info['token']}"}
+    _add_mcp_server(antigravity, mcp_name, {"serverUrl": info["mcp_url"], "headers": bearer, "disabled": False})
+    done = [f"Antigravity CLI MCP server '{mcp_name}' in {antigravity} (start agy again to load it; `agy mcp list` lists it)"]
+    if legacy:
+        _add_mcp_server(gemini_cli, mcp_name, {"httpUrl": info["mcp_url"], "headers": bearer, "trust": False})
+        done.append(f"Gemini CLI MCP server '{mcp_name}' in {gemini_cli} (trust the folder you run gemini in)")
     env = config / f"{agent}.env"
     write_secret(env, env_lines({"PACT_URL": info["board_url"], "PACT_TOKEN": info["token"]}))
-    return [
-        f"Gemini CLI MCP server '{mcp_name}' in {settings} (restart gemini to load it; /mcp lists it)",
-        f"hooks env: {env}",
-    ]
+    return [*done, f"hooks env: {env}"]
 
 
 def runner_env(info: dict[str, Any], repo: Path | None, role_file: Path | None) -> dict[str, str]:
@@ -211,7 +228,10 @@ def main() -> None:
     p.add_argument("board", help="the board URL shown with the setup code")
     p.add_argument("code", help="the one-time setup code (pcs_...)")
     p.add_argument("--dir", default=".", help="Claude Code: the project directory to add the MCP server to")
-    p.add_argument("--mcp-name", default="pact", help="Claude Code and Gemini CLI: the MCP server name (default: pact)")
+    p.add_argument("--mcp-name", default="pact", help="Claude Code and Gemini: the MCP server name (default: pact)")
+    p.add_argument(
+        "--gemini-cli", action="store_true", help="Gemini: also configure Gemini CLI (API-key users), not only Antigravity CLI"
+    )
     p.add_argument("--repo", help="Runner: a local clone, or a git URL to clone for it")
     p.add_argument("--no-launch", action="store_true", help="Runner: write the LaunchAgent but do not start it")
     p.add_argument("--force", action="store_true", help="overwrite an existing env file for this agent")
@@ -225,7 +245,7 @@ def main() -> None:
     if info["client"] == "runner":
         steps = connect_runner(info, args.repo, not args.no_launch)
     elif info["client"] == "gemini":
-        steps = connect_gemini(info, args.mcp_name)
+        steps = connect_gemini(info, args.mcp_name, legacy=args.gemini_cli)
     else:
         steps = connect_code(info, Path(args.dir).resolve(), args.mcp_name)
     for step in steps:
