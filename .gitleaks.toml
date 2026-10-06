@@ -1,0 +1,9 @@
+# gitleaks' own rules, plus the token format this project issues.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "pact-token"
+description = "PACT Board agent token"
+regex = '''\bpact_[A-Za-z0-9_-]{30,}'''
+keywords = ["pact_"]

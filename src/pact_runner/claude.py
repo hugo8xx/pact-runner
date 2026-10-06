@@ -10,6 +10,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import signal
 import time
 from collections.abc import Awaitable, Callable
@@ -181,9 +182,14 @@ def role_prompt(cfg: RunnerConfig, task_id: str, branch: str, mandate_id: str = 
     return "\n".join(s for s in sections if s)
 
 
+def guard_command(cfg: RunnerConfig) -> str:
+    argv = [*cfg.guard, *(["--deny-file", str(cfg.deny_file)] if cfg.deny_file else [])]
+    return " ".join(shlex.quote(a) for a in argv)
+
+
 def settings(cfg: RunnerConfig) -> dict[str, Any]:
     hooks: dict[str, Any] = {
-        "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": " ".join(cfg.guard)}]}],
+        "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": guard_command(cfg)}]}],
     }
     if cfg.entry_hook:
         hooks["PostToolUse"] = [{"matcher": "", "hooks": [{"type": "command", "command": cfg.entry_hook}]}]

@@ -135,6 +135,8 @@ class RunnerConfig:
     context_files: tuple[Path, ...] = ()
     """The owner's CLAUDE.md files, put into every new session's role. The session loads only project
     settings, so it would never see them otherwise. Missing files are skipped."""
+    deny_file: Path | None = None
+    """Words the guard keeps out of pushes and PRs (real hosts, names, emails), one per line."""
     entry_hook: str | None = None
     """Shell command for a PostToolUse hook that logs entries to the board (hooks/pact-hook.sh)."""
     guard: tuple[str, ...] = field(default_factory=lambda: (sys.executable, "-m", "pact_runner.guard"))
@@ -189,5 +191,6 @@ class RunnerConfig:
             allowed_tools=_list("PACT_RUNNER_ALLOWED_TOOLS", DEFAULT_ALLOWED_TOOLS),
             role_file=Path(role).expanduser() if role else None,
             context_files=() if context == ("none",) else tuple(Path(f).expanduser() for f in context),
+            deny_file=Path(deny).expanduser() if (deny := _env("PACT_RUNNER_DENY_FILE")) else None,
             entry_hook=_env("PACT_RUNNER_ENTRY_HOOK") or None,
         )
