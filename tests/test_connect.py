@@ -69,3 +69,31 @@ def test_redeem_reports_the_boards_refusal() -> None:
 def test_a_runner_prompt_shows_the_budget_left() -> None:
     prompt = task_prompt({"id": "t1", "title": "fix", "body": "b", "_budget": {"runs": 2.0, "turns": 40.0}})
     assert "runs 2, turns 40" in prompt
+
+
+def test_pact_connect_adds_the_board_to_gemini_and_keeps_the_rest(tmp_path: Path) -> None:
+    settings = tmp_path / ".gemini" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text(json.dumps({"theme": "Dracula", "mcpServers": {"other": {"command": "x"}}}))
+    info = _info(agent_id="gemini-web", client="gemini", mcp_url="https://board.example/mcp/a/gemini-web")
+    steps = connect.connect_gemini(info, "pact", config=tmp_path / "config", settings=settings)
+    data = json.loads(settings.read_text())
+    assert data["theme"] == "Dracula" and data["mcpServers"]["other"] == {"command": "x"}
+    assert data["mcpServers"]["pact"] == {
+        "httpUrl": "https://board.example/mcp/a/gemini-web",
+        "headers": {"Authorization": "Bearer pact_secret"},
+        "trust": False,
+    }
+    assert settings.stat().st_mode & 0o777 == 0o600 and (tmp_path / "config" / "gemini-web.env").exists()
+    assert any("restart gemini" in s for s in steps)
+
+
+def test_pact_connect_creates_gemini_settings_and_refuses_a_broken_file(tmp_path: Path) -> None:
+    settings = tmp_path / "new" / "settings.json"
+    info = _info(client="gemini")
+    connect.connect_gemini(info, "board", config=tmp_path / "config", settings=settings)
+    assert "board" in json.loads(settings.read_text())["mcpServers"]
+    settings.write_text("{ // a comment\n}")
+    with pytest.raises(SystemExit, match="not plain JSON"):
+        connect.connect_gemini(info, "board", config=tmp_path / "config", settings=settings)
+    assert settings.read_text().startswith("{ //")  # left as it was
