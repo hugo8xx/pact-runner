@@ -108,3 +108,125 @@ def test_pact_connect_leaves_a_broken_config_alone(tmp_path: Path) -> None:
             _info(client="gemini"), "pact", config=tmp_path / "c", antigravity=agy, gemini_cli=tmp_path / "s.json"
         )
     assert agy.read_text().startswith("{ //")
+
+
+HOOK = "/opt/pact/bin/pact-hook"
+
+
+def _code_info() -> dict[str, Any]:
+    return _info(agent_id="code-web", client="code", mcp_url="https://board.example/mcp/a/code-web")
+
+
+def _no_claude(monkeypatch: pytest.MonkeyPatch, hook: str = HOOK) -> None:
+    monkeypatch.setattr(connect.shutil, "which", lambda name: hook if name == "pact-hook" else None)
+
+
+def test_pact_connect_installs_the_hooks_into_a_fresh_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_claude(monkeypatch)
+    steps = connect.connect_code(_code_info(), tmp_path, "pact", config=tmp_path / "config")
+    settings = tmp_path / ".claude" / "settings.local.json"
+    assert any(str(settings) in s for s in steps)
+    text = settings.read_text()
+    assert text.startswith('{\n  "hooks"') and text.endswith("}\n")
+    hooks = json.loads(text)["hooks"]
+    assert set(hooks) == {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"}
+    assert hooks["PostToolUse"] == [
+        {
+            "matcher": "Bash|Edit|MultiEdit|Write|NotebookEdit",
+            "hooks": [{"type": "command", "command": f"{HOOK} code-web post-tool-use", "timeout": 10}],
+        }
+    ]
+    assert hooks["SessionStart"] == [{"hooks": [{"type": "command", "command": f"{HOOK} code-web session-start", "timeout": 10}]}]
+    assert hooks["Stop"][0]["hooks"][0]["command"] == f"{HOOK} code-web stop"
+    assert "pact_secret" not in text
+
+
+def test_pact_connect_keeps_other_settings_and_hooks_and_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_claude(monkeypatch)
+    settings = tmp_path / ".claude" / "settings.local.json"
+    settings.parent.mkdir()
+    other = {"type": "command", "command": "echo mine"}
+    old_pact = {"type": "command", "command": "/old/place/pact-hook.sh code-web stop"}
+    other_agent = {"type": "command", "command": f"{HOOK} code-api stop", "timeout": 10}
+    settings.write_text(
+        json.dumps(
+            {
+                "permissions": {"allow": ["Bash(ls:*)"]},
+                "hooks": {
+                    "Stop": [{"hooks": [other, old_pact]}, {"hooks": [other_agent]}],
+                    "PreToolUse": [{"matcher": "Bash", "hooks": [other]}],
+                },
+            }
+        )
+    )
+    connect.install_hooks(tmp_path, "code-web")
+    first = settings.read_text()
+    data = json.loads(first)
+    assert data["permissions"] == {"allow": ["Bash(ls:*)"]}
+    assert data["hooks"]["PreToolUse"] == [{"matcher": "Bash", "hooks": [other]}]
+    assert data["hooks"]["Stop"] == [
+        {"hooks": [other]},
+        {"hooks": [other_agent]},
+        {"hooks": [{"type": "command", "command": f"{HOOK} code-web stop", "timeout": 10}]},
+    ]
+    connect.install_hooks(tmp_path, "code-web")
+    assert settings.read_text() == first
+
+
+def test_pact_connect_refuses_a_settings_file_that_is_not_plain_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_claude(monkeypatch)
+    settings = tmp_path / ".claude" / "settings.local.json"
+    settings.parent.mkdir()
+    settings.write_text('{ // mine\n  "hooks": {}\n}')
+    with pytest.raises(SystemExit, match="not plain JSON"):
+        connect.connect_code(_code_info(), tmp_path, "pact", config=tmp_path / "config")
+    assert settings.read_text().startswith("{ // mine")
+
+
+def test_no_hooks_leaves_the_settings_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_claude(monkeypatch)
+    steps = connect.connect_code(_code_info(), tmp_path, "pact", config=tmp_path / "config", hooks=False)
+    assert not (tmp_path / ".claude").exists() and not any("hooks:" in s for s in steps)
+    assert (tmp_path / "config" / "code-web.env").exists()
+
+
+def test_a_hook_path_with_spaces_is_quoted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_claude(monkeypatch, "/Users/you/Application Support/bin/pact-hook")
+    connect.install_hooks(tmp_path, "code-web")
+    connect.install_hooks(tmp_path, "code-web")  # the quoted command is recognised and replaced
+    hooks = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())["hooks"]
+    assert len(hooks["Stop"]) == 1
+    command = hooks["Stop"][0]["hooks"][0]["command"]
+    assert command == "'/Users/you/Application Support/bin/pact-hook' code-web stop"
+    import shlex
+
+    assert shlex.split(command)[0] == "/Users/you/Application Support/bin/pact-hook"
+
+
+def test_hook_command_falls_back_to_the_script_next_to_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(connect.shutil, "which", lambda name: None)
+    import shlex
+    import sys
+
+    assert shlex.split(connect.hook_command())[0] == str(Path(sys.executable).parent / "pact-hook")
+
+
+def test_hooks_only_needs_the_env_file_and_never_prints_the_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _no_claude(monkeypatch)
+    config = tmp_path / "config"
+    monkeypatch.setattr(connect, "CONFIG", config)
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(connect.sys, "argv", ["pact-connect", "hooks", "code-web", "--dir", str(project)])
+    with pytest.raises(SystemExit, match="does not exist"):
+        connect.main()
+    assert not (project / ".claude").exists()
+    token = "pact_" + "fake" * 4
+    connect.write_secret(config / "code-web.env", connect.env_lines({"PACT_URL": "https://board.example", "PACT_TOKEN": token}))
+    connect.main()
+    out = capsys.readouterr().out
+    assert token not in out and str(project / ".claude" / "settings.local.json") in out
+    hooks = json.loads((project / ".claude" / "settings.local.json").read_text())["hooks"]
+    assert hooks["UserPromptSubmit"][0]["hooks"][0]["command"] == f"{HOOK} code-web user-prompt-submit"

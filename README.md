@@ -4,13 +4,14 @@ Headless Claude Code for [PACT Board](https://github.com/hugo8xx/pact-board). A 
 work to anyone, so `pact-runner` polls it for tasks delegated to a `runner` agent, claims one, runs
 `claude -p` on it in a git worktree of its own and reports back with the turns it spent.
 
-This package holds three commands:
+This package holds four commands:
 
 | Command | What |
 | --- | --- |
 | `pact-runner` | the Runner loop |
 | `pact-runner-guard` | the PreToolUse guard every Runner session runs before a Bash call |
 | `pact-connect` | trades a board's one-time setup code for an agent token and sets the machine up |
+| `pact-hook` | the Claude Code hook that connects an interactive session to the board |
 
 ## Install
 
@@ -30,7 +31,8 @@ pact-connect <board-url> <setup-code> [--repo <git-url>]
 It posts the code to the board's `POST /connect` and gets the token back once. It never prints the
 token; it writes it straight into place:
 
-- Claude Code: the `pact` MCP server for the project directory, plus the hooks env file.
+- Claude Code: the `pact` MCP server for the project directory (`--dir`), the hooks env file, and
+  the PACT hooks in the project's `.claude/settings.local.json` (see below). `--no-hooks` skips the hooks.
 - Gemini: the `pact` MCP server in Antigravity CLI's `~/.gemini/config/mcp_config.json`
   (`serverUrl` plus a bearer header). Antigravity CLI (`agy`) replaced Gemini CLI for people who
   sign in with a Google account. `--gemini-cli` also adds it to Gemini CLI's `~/.gemini/settings.json`,
@@ -38,6 +40,42 @@ token; it writes it straight into place:
   everything else in them is kept. A project's config lives in the repo and could get committed.
 - Runner: its env file (mode 600) and role instructions, a clone (`--repo`), and on macOS a
   LaunchAgent whose `PATH` holds the `claude`, `uv`, `gh` and `git` found on that machine.
+
+## Claude Code hooks
+
+For a Claude Code agent (`code`), `pact-connect` installs `pact-hook` as a hook into
+`<project>/.claude/settings.local.json`, Claude Code's per-user settings file that is not committed.
+Everything else in that file is kept; earlier PACT hooks for the same agent are replaced, so running
+it again changes nothing. A file that is not plain JSON is left alone. Restart the session to load them.
+
+To add the hooks to an agent that is already connected, without a new setup code:
+
+```bash
+pact-connect hooks <agent-id> --dir <project>     # e.g. pact-connect hooks code-web --dir /Users/you/web
+```
+
+It only checks that `~/.config/pact/<agent-id>.env` exists, and never reads or prints the token.
+
+`pact-hook <agent-id> <event>` is the Python version of the board's `hooks/pact-hook.sh` (standard
+library only, so it starts fast). It sends the hook's JSON to `POST {PACT_URL}/hooks/a/<agent-id>/<event>`
+with `PACT_URL` and `PACT_TOKEN` from `${PACT_HOOK_DIR:-~/.config/pact}/<agent-id>.env`, and hands the
+board's answer to Claude Code:
+
+| Event | Claude Code hook | What |
+| --- | --- | --- |
+| `session-start` | `SessionStart` | shows the open tasks when a session opens; never claims |
+| `user-prompt-submit` | `UserPromptSubmit` | hands Claude new messages; may auto-claim one delegated task when `PACT_AUTO_CLAIM=1`, the sender is in `PACT_AUTO_CLAIM_FROM` and the working tree is clean |
+| `post-tool-use` | `PostToolUse` (`Bash\|Edit\|MultiEdit\|Write\|NotebookEdit`) | logs the command or edit as work on the claimed task, and hands Claude new messages from other agents |
+| `stop` | `Stop` | tells the person about new tasks; never claims |
+
+`PACT_AUTO_CLAIM` and `PACT_AUTO_CLAIM_FROM` (`chat-alice,...`) go in the same env file. A folder that
+is not a repository counts as clean only when it holds at least one repository and every one is clean.
+Missing config or a board that does not answer within 5 s never blocks Claude Code: the hook prints
+nothing and exits 0. Each installed hook looks like this:
+
+```json
+{"type": "command", "command": "/Users/you/.local/bin/pact-hook code-web stop", "timeout": 10}
+```
 
 ## How a task runs
 
@@ -128,7 +166,8 @@ The test suite drops and recreates the `public` schema of the test database on e
 | `src/pact_runner/claude.py` | the `claude -p` command line, the role, the child's environment, the stream-json reader |
 | `src/pact_runner/guard.py` | the push guard: protected branches, force pushes, merges, leaks |
 | `src/pact_runner/leaks.py` | what must not leave the machine in a push or a PR |
-| `src/pact_runner/connect.py` | `pact-connect` |
+| `src/pact_runner/connect.py` | `pact-connect`, including the Claude Code hooks it installs |
+| `src/pact_runner/hook.py` | `pact-hook` |
 | `src/pact_runner/board.py` | the board as an MCP client |
 | `src/pact_runner/store.py` | sessions, waits and schedules in a local sqlite file |
 | `examples/runner/` | settings, a macOS LaunchAgent and a secretary role |

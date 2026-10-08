@@ -15,6 +15,7 @@ dependencies = [
 pact-runner = "pact_runner.__main__:main"
 pact-runner-guard = "pact_runner.guard:main"
 pact-connect = "pact_runner.connect:main"
+pact-hook = "pact_runner.hook:main"
 
 [build-system]
 requires = ["hatchling"]
