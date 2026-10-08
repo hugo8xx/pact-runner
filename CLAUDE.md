@@ -20,7 +20,7 @@ gitleaks on every PR as well.
 
 ## Layout
 
-- `src/pact_runner/`: PACT Runner (headless `claude -p` per task), `pact-runner-guard` and `pact-connect`.
+- `src/pact_runner/`: PACT Runner (headless `claude -p` per task), `pact-runner-guard`, `pact-connect` and `pact-hook`.
   It talks to the board over MCP only; never import `pact` (the board) from here.
 - `tests/`: pytest. The Runner runs against a real board in-process (`pact-board`, a dev dependency
   pinned to a commit) and Postgres (`pact_test` by default, or `DATABASE_URL`).
