@@ -1,5 +1,6 @@
 """The Runner loop: poll the board, claim a delegated task with a run reserved from the budget, run
-Claude in the task's worktree, report the outcome and the turns it spent.
+Claude in the task's worktree, report the outcome and the turns it spent. Between polls it holds
+``pact_events`` open, so work that arrives starts at once rather than on the next poll.
 
 Stops for good (exit 0) on the kill switch, a paused agent or a dead mandate. Never retries in a
 loop: a quota hit, a timeout or a run without an answer goes to a person as input_required.
@@ -36,6 +37,9 @@ def has_handoff(result: str) -> bool:
 
 
 TERMINAL = frozenset({"completed", "failed", "canceled", "rejected"})
+
+EVENTS_MAX_SECONDS = 50
+"""The longest wait the board allows on one pact_events call."""
 
 DROP = frozenset({"already_claimed", "wrong_agent", "invalid_request", "approval_pending", "not_found", "project_mismatch"})
 """Claim refusals that only mean "not this task": forget it and move on."""
@@ -102,6 +106,10 @@ class Runner:
         self.mandate_id = cfg.mandate_id or ""
         self.project_id = cfg.project_id
         self.since: int | None = None
+        self.events_since: int | None = None
+        """pact_events' own cursor: it moves past messages too, which pact_list's does not."""
+        self.events = True
+        """Whether to wait on pact_events between polls; off once a board without it says so."""
         self.backlog: dict[str, dict[str, Any]] = {}
         self.running: dict[str, asyncio.Task[None]] = {}
         self.beats: dict[str, float] = {}
@@ -137,7 +145,7 @@ class Runner:
                 await self._refused(err)
             except Exception:  # the board or network may be down; try again next poll
                 log.exception("poll failed")
-            await asyncio.sleep(self.cfg.poll_seconds)
+            await self.idle()
         await self.drain()
         return self.stopped
 
@@ -149,6 +157,46 @@ class Runner:
         if not self.stopped:
             log.warning("runner stopping: %s", reason)
             self.stopped = reason
+
+    # ── between polls ─────────────────────────────────────────────────────
+
+    async def idle(self) -> None:
+        """Wait for the next poll: until the board has work or a message for this runner, a run
+        ends, or ``poll_seconds`` pass (at most 50), whichever is first. The slow poll stays as a
+        safety net. Without pact_events on the board, just sleep."""
+        seconds = min(self.cfg.poll_seconds, EVENTS_MAX_SECONDS)
+        if not self.events or self.stopped:
+            await asyncio.sleep(seconds)
+            return
+        started = time.monotonic()
+        waiter = asyncio.create_task(self._wait_events(seconds))
+        await asyncio.wait([waiter, *self.running.values()], return_when=asyncio.FIRST_COMPLETED)
+        if not waiter.done():
+            waiter.cancel()  # a run ended first: poll now, a slot may be free
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            if not waiter.cancelled():
+                raise
+        except Exception as err:
+            if "unknown tool" in str(err).lower() or (isinstance(err, BoardRefusal) and err.code == "invalid_response"):
+                log.warning("the board has no pact_events; polling every %gs", seconds)
+                self.events = False
+            elif isinstance(err, BoardRefusal):
+                await self._refused(err)
+            else:  # the board or network may be down: wait out the poll as before
+                log.exception("waiting for events failed")
+            await asyncio.sleep(max(0.0, seconds - (time.monotonic() - started)))
+
+    async def _wait_events(self, seconds: float) -> None:
+        since = max(self.since or 0, self.events_since or 0)
+        out = await self._call(
+            "pact_events",
+            {"mandate_id": self.mandate_id, "since": since, "seconds": seconds, "project_id": self.project_id},
+        )
+        self.events_since = max(since, int(out.get("next_since") or 0))
+        if out.get("events"):
+            log.info("woken by %d event(s) from the board", len(out["events"]))
 
     # ── one poll ──────────────────────────────────────────────────────────
 
