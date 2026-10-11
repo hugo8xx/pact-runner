@@ -50,6 +50,7 @@ class InProcessBoard:
             "pact_report": self.board.report,
             "pact_defer": self.board.defer,
             "pact_post": self.board.post,
+            "pact_events": self.board.wait_events,
         }[tool]
         try:
             return await fn(self.agent, **args)  # type: ignore[operator]
@@ -769,3 +770,72 @@ async def test_a_structured_report_reaches_people_as_a_card(world: World, tmp_pa
     row = await task_row(world, tid)
     assert row["status"] == "completed" and row["result"]["report"]["greeting"] == "Morning"
     assert "## Handoff" in row["result"]["handoff"]
+
+
+# ── waiting for work between polls ────────────────────────────────────────────
+
+
+async def test_work_that_arrives_wakes_the_runner_before_the_next_poll(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None, poll_seconds=30)
+    await once(runner)  # nothing yet; the cursor is now at the head
+    began = time.monotonic()
+    idle = asyncio.create_task(runner.idle())
+    await asyncio.sleep(0.3)
+    task_id = await delegate(world)
+    await asyncio.wait_for(idle, 10)
+    assert time.monotonic() - began < 10  # woken by the event, not by the 30-second poll
+    await once(runner)
+    assert (await task_row(world, task_id))["status"] == "completed"
+
+
+async def test_nothing_new_waits_out_the_poll(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None, poll_seconds=0.5)
+    await once(runner)
+    began = time.monotonic()
+    await runner.idle()
+    assert 0.4 <= time.monotonic() - began < 5
+    assert runner.events
+
+
+async def test_a_run_that_ends_wakes_the_runner(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None, poll_seconds=30)
+    await once(runner)
+    runner.running["t"] = asyncio.create_task(asyncio.sleep(0.2))
+    began = time.monotonic()
+    await asyncio.wait_for(runner.idle(), 10)
+    assert time.monotonic() - began < 5
+
+
+async def test_an_event_moves_the_cursor_so_it_does_not_wake_again(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None, poll_seconds=0.5, take_open=False)
+    await once(runner)
+    # An open task the runner does not take still wakes it once; the next wait must not see it again.
+    await world.board.post(
+        world.agents["chat-boss"], project_id="web", title="for someone else", mandate_id=world.roots["chat-boss"]
+    )
+    began = time.monotonic()
+    await runner.idle()
+    assert time.monotonic() - began < 0.4
+    began = time.monotonic()
+    await runner.idle()
+    assert time.monotonic() - began >= 0.4
+
+
+class OldBoard(InProcessBoard):
+    """A board from before pact_events."""
+
+    async def call(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        if tool == "pact_events":
+            self.calls.append(tool)
+            raise BoardRefusal("invalid_response", "Unknown tool: pact_events")
+        return await super().call(tool, args)
+
+
+async def test_a_board_without_events_falls_back_to_polling(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None, poll_seconds=0.2)
+    runner.board = old = OldBoard(world.board, world.agents["runner-web"])
+    await runner.idle()
+    await runner.idle()
+    assert not runner.events
+    assert old.calls.count("pact_events") == 1  # asked once, then sleeps
+    assert runner.stopped is None

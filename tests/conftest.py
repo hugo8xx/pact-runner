@@ -93,7 +93,10 @@ async def world() -> AsyncIterator[World]:
         await conn.execute(f"TRUNCATE {TABLES} CASCADE")
         await conn.execute("ALTER TABLE entries ENABLE TRIGGER entries_no_update")
         await conn.execute("UPDATE system_state SET halted = false")
+        await conn.execute("UPDATE orgs SET halted = false")  # the kill switch is per organization now
     admin = Admin(pool)
     await admin.add_human("boss", "Boss", "owner")
-    yield World(pool=pool, admin=admin, board=Board(pool))
+    board = Board(pool)
+    yield World(pool=pool, admin=admin, board=board)
+    await board.close()  # the listener behind pact_events
     await pool.close()

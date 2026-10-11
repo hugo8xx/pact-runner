@@ -1,8 +1,13 @@
 # PACT Runner
 
-Headless Claude Code for [PACT Board](https://github.com/hugo8xx/pact-board). A board cannot push
-work to anyone, so `pact-runner` polls it for tasks delegated to a `runner` agent, claims one, runs
-`claude -p` on it in a git worktree of its own and reports back with the turns it spent.
+Headless Claude Code for [PACT Board](https://github.com/hugo8xx/pact-board). `pact-runner` takes
+tasks delegated to a `runner` agent, claims one, runs `claude -p` on it in a git worktree of its own
+and reports back with the turns it spent.
+
+Between polls it holds the board's `pact_events` long-poll open, so a task or message that arrives
+starts work at once instead of on the next poll; the board counts that wait as the agent being
+online. The poll every `PACT_RUNNER_POLL_SECONDS` (30 by default, at most 50 per wait) stays as a
+safety net, and against a board without `pact_events` the Runner just polls.
 
 This package holds four commands:
 
@@ -162,7 +167,7 @@ The test suite drops and recreates the `public` schema of the test database on e
 
 | Path | What |
 | --- | --- |
-| `src/pact_runner/runner.py` | the loop: poll, claim with a reserved run, run, report |
+| `src/pact_runner/runner.py` | the loop: wait for events or poll, claim with a reserved run, run, report |
 | `src/pact_runner/claude.py` | the `claude -p` command line, the role, the child's environment, the stream-json reader |
 | `src/pact_runner/guard.py` | the push guard: protected branches, force pushes, merges, leaks |
 | `src/pact_runner/leaks.py` | what must not leave the machine in a push or a PR |

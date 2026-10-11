@@ -34,16 +34,18 @@ class McpBoard:
         self.token = token
 
     @asynccontextmanager
-    async def _session(self) -> AsyncIterator[ClientSession]:
+    async def _session(self, http_timeout: float = 30) -> AsyncIterator[ClientSession]:
         headers = {"Authorization": f"Bearer {self.token}"}
-        async with httpx2.AsyncClient(headers=headers, timeout=30) as http:
+        async with httpx2.AsyncClient(headers=headers, timeout=http_timeout) as http:
             async with streamable_http_client(self.url, http_client=http, terminate_on_close=False) as streams:
                 async with ClientSession(streams[0], streams[1]) as s:
                     await s.initialize()
                     yield s
 
     async def call(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
-        async with self._session() as s:
+        # A long-poll holds the call open for its whole wait, so it needs longer than the default.
+        http_timeout = 30 + float(args.get("seconds") or 0) if tool == "pact_events" else 30
+        async with self._session(http_timeout) as s:
             result = await s.call_tool(tool, {k: v for k, v in args.items() if v is not None})
         text = "".join(getattr(c, "text", "") for c in result.content)
         try:
