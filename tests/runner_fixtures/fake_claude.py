@@ -73,6 +73,10 @@ results = {
         "result": "Brief.\n\n## Handoff\n- Done: brief",
         "report": {"greeting": "Morning", "sections": [{"title": "Progress", "items": [{"text": "R3 done"}]}]},
     },
+    "handover": {
+        "status": "input_required",
+        "result": "Half done.\n\n## Handoff\n- Done: the parser\n- Left: the tests\n- Branch: pushed",
+    },
     "child": {"status": "completed", "result": "Docs written.\n\n## Handoff\n- Done: docs on the worker's branch"},
 }
 if mode == "quota":

@@ -91,6 +91,18 @@ Rules:
   defer (the task needs authority your mandate lacks; give needed_scope), or waiting (see above).
 """
 
+WRAP_UP_TURNS = 8
+"""Turns kept back from a run's budget so a run that hits its limit can still hand its work over."""
+
+WRAP_UP = """This run hit its {limit}, so stop the task here and hand it over; do not try to finish it.
+1. If the worktree has changes, commit them on branch {branch} as work in progress (for example
+   `wip(scope): what is half done`) and push the branch, each in a Bash call of its own. Skip this when
+   nothing changed or there is no remote. Do not open a PR for unfinished work.
+2. Return status input_required. result must hold a '## Handoff' section for whoever picks the task up:
+   what is done; what is left, as concrete next steps; whether the checks pass right now; the branch
+   and last commit (or that nothing was pushed, and why).
+"""
+
 WORKERS = """To split off work that can run on its own, post a subtask: pact_post with project_id={project},
   mandate_id={mandate}, parent_task_id={task}, delegate_to one of {names}, a self-contained title and
   body (the worker sees nothing else), and child_limits such as {{"runs": 1, "turns": 20}} taken from
@@ -150,6 +162,8 @@ class Outcome:
     quota_hit: bool = False
     rate_limit: dict[str, Any] | None = None
     stderr: str = ""
+    handoff: str | None = None
+    """What the session wrote when it handed the task over after hitting a limit."""
 
     @property
     def resume_failed(self) -> bool:
