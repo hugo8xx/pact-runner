@@ -152,7 +152,8 @@ async def test_13_a_delegated_task_runs_to_the_end_unattended(world: World, tmp_
     argv = call["argv"]
     assert "--dangerously-skip-permissions" not in argv
     assert argv[argv.index("--permission-mode") + 1] == "default"
-    assert argv[argv.index("--max-turns") + 1] == "30"  # the task's budget, below the runner's 40
+    # The task's budget (30, below the runner's 40) less the turns kept back for a hand-over.
+    assert argv[argv.index("--max-turns") + 1] == "22"
     assert "--append-system-prompt" in argv and "--resume" not in argv
     assert "mcp__pact__pact_report" in argv[argv.index("--disallowedTools") + 1]
     assert "Please fix the thing." in call["stdin"]
@@ -595,7 +596,7 @@ def assert_iso_with_zone(at: str) -> None:
         ("input_required", "input_required", "3"),
         ("defer", "defer", "3"),
         ("quota", "rate-limited", "1"),
-        ("max_turns", "max-turns", "7"),
+        ("max_turns", "max-turns", "14"),  # the run's 7 and the hand-over's 7
     ],
 )
 async def test_a_run_logs_its_start_and_end(
@@ -839,3 +840,51 @@ async def test_a_board_without_events_falls_back_to_polling(world: World, tmp_pa
     assert not runner.events
     assert old.calls.count("pact_events") == 1  # asked once, then sleeps
     assert runner.stopped is None
+
+
+# ── handing over a run that hits a limit ──────────────────────────────────────
+
+
+async def test_a_run_out_of_turns_hands_its_work_over(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None)
+    fake.script("max_turns", "handover")
+    tid = await delegate(world)
+    await once(runner)
+    row = await task_row(world, tid)
+    assert row["status"] == "input_required"
+    assert "ran out of turns" in row["result"] and "## Handoff\n- Done: the parser" in row["result"]
+    _, wrap = fake.calls()
+    assert "--resume" in wrap["argv"] and wrap["argv"][wrap["argv"].index("--max-turns") + 1] == "8"
+    assert "turns limit" in wrap["stdin"] and "runner/" in wrap["stdin"]
+    assert wrap["env"]["PACT_WAKE_REASON"] == "hand_over"
+
+
+async def test_a_timed_out_run_hands_its_work_over(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None, run_timeout_seconds=1, kill_grace_seconds=1)
+    fake.script("sleep", "handover")
+    tid = await delegate(world)
+    await asyncio.wait_for(once(runner), timeout=20)
+    row = await task_row(world, tid)
+    assert row["status"] == "input_required"
+    assert "minute limit" in row["result"] and "- Left: the tests" in row["result"]
+    assert "time limit" in fake.calls()[1]["stdin"]
+
+
+async def test_a_hand_over_without_a_handoff_still_asks_a_person(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None)
+    fake.script("max_turns", "max_turns")
+    tid = await delegate(world)
+    await once(runner)
+    row = await task_row(world, tid)
+    assert row["status"] == "input_required" and "ran out of turns" in row["result"]
+    assert "handed the task over" not in row["result"]
+
+
+async def test_a_budget_too_small_to_spare_turns_gets_no_hand_over(world: World, tmp_path: Path, fake: Fake) -> None:
+    runner = await setup(world, tmp_path, None)
+    fake.mode("max_turns")
+    tid = await delegate(world, limits={"runs": 1, "turns": 12})
+    await once(runner)
+    [only] = fake.calls()
+    assert only["argv"][only["argv"].index("--max-turns") + 1] == "12"
+    assert (await task_row(world, tid))["status"] == "input_required"

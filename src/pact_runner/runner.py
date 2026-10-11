@@ -13,16 +13,16 @@ import logging
 import os
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from . import worktree
 from .board import FATAL, BoardClient, BoardRefusal
-from .claude import Outcome, Run, execute, role_prompt
+from .claude import WRAP_UP, WRAP_UP_TURNS, Outcome, Run, execute, role_prompt
 from .config import RunnerConfig
 from .store import Session, Store, Waiting
 
@@ -75,6 +75,11 @@ def _at(timestamp: float) -> str:
 def short_title(title: str, limit: int = 80) -> str:
     title = " ".join(title.split())
     return title if len(title) <= limit else title[: limit - 1] + "…"
+
+
+def _handed_over(out: Outcome) -> str:
+    """The session's own handoff, for a report that stops a run short; empty without one."""
+    return f"\n\nThe session handed the task over:\n\n{out.handoff}" if out.handoff else ""
 
 
 def subtasks_prompt(subtasks: list[dict[str, Any]]) -> str:
@@ -357,6 +362,11 @@ class Runner:
                 if err.code != "claim_lost":
                     await self._refused(err)
 
+        # Keep a few turns back so a run that hits the limit can still commit, push and hand over
+        # within the task's budget. A budget too small to spare them gets no hand-over.
+        spare = WRAP_UP_TURNS if max_turns > 2 * WRAP_UP_TURNS else 0
+        work_turns = max_turns - spare
+
         def run_for(resume_id: str | None) -> Run:
             if wake == "subtasks":
                 follow_up = subtasks_prompt(subtasks or [])
@@ -371,7 +381,7 @@ class Runner:
                 workdir=workdir,
                 branch=branch,
                 mcp_config=self.cfg.state_dir / "mcp.json",
-                max_turns=max_turns,
+                max_turns=work_turns,
                 resume=resume_id,
                 env={
                     "PACT_TASK_ID": task_id,
@@ -391,6 +401,9 @@ class Runner:
             out = await execute(
                 self.cfg, run_for(None), role, should_stop=halt, tick=heartbeat, tick_seconds=self.cfg.heartbeat_seconds
             )
+        limit = "turns limit" if out.subtype == "error_max_turns" else "time limit" if out.timed_out else None
+        if limit and spare and out.session_id and not out.quota_hit and not halt():
+            await self._hand_over(out, replace(run_for(None), resume=out.session_id), limit, spare, role, halt, heartbeat)
         record.turns = out.num_turns if out.turns_reported else None
         self._remember_quota(out)
         if out.session_id:
@@ -399,6 +412,33 @@ class Runner:
             record.result = "claim_lost" if lost else "stopped"
             return  # the claim is gone or the runner is stopping; nobody to report to
         record.result = await self._finish(task, mandate, workdir, branch, out, max_turns)
+
+    async def _hand_over(
+        self,
+        out: Outcome,
+        run: Run,
+        limit: str,
+        turns: int,
+        role: str,
+        halt: Callable[[], bool],
+        heartbeat: Callable[[], Awaitable[None]],
+    ) -> None:
+        """After a run hits its turns or time limit, resume the same session for a few turns to
+        commit and push what it has and write a handoff, so someone else can pick the task up.
+        The push goes through the same guard as any other. Folds the wrap-up into ``out``."""
+        run.prompt = WRAP_UP.format(limit=limit, branch=run.branch)
+        run.max_turns = turns
+        run.env = {**run.env, "PACT_WAKE_REASON": "hand_over"}
+        wrap = await execute(self.cfg, run, role, should_stop=halt, tick=heartbeat, tick_seconds=self.cfg.heartbeat_seconds)
+        out.num_turns += wrap.num_turns
+        out.session_id = wrap.session_id or out.session_id
+        out.quota_hit = out.quota_hit or wrap.quota_hit
+        out.rate_limit = wrap.rate_limit or out.rate_limit
+        text = str((wrap.structured or {}).get("result") or "")
+        if has_handoff(text):
+            out.handoff = text
+        else:
+            log.warning("task %s: the hand-over after the %s returned no handoff", run.task_id, limit)
 
     async def _finish(self, task: dict[str, Any], mandate: str, workdir: Path, branch: str, out: Outcome, max_turns: int) -> str:
         """Report the run's outcome to the board; returns it for the log: the status sent, or
@@ -425,7 +465,7 @@ class Runner:
                 mandate,
                 "input_required",
                 f"The run hit the {self.cfg.run_timeout_seconds / 60:g}-minute limit ({where}). "
-                "Resume the task to continue from the saved session, or cancel it.",
+                "Resume the task to continue from the saved session, or cancel it." + _handed_over(out),
                 usage,
             )
             return "timeout"
@@ -476,12 +516,12 @@ class Runner:
             return "defer"
         max_turns_hit = out.subtype == "error_max_turns"
         why = "ran out of turns" if max_turns_hit else f"ended without a result ({out.subtype or out.exit_code})"
-        detail = (out.text or out.stderr).strip()[-1500:]
+        detail = "" if out.handoff else (out.text or out.stderr).strip()[-1500:]
         await self._report(
             task_id,
             mandate,
             "input_required",
-            f"The run {why} ({where}).\n\n{detail}\n\nResume to continue from the saved session, or cancel.",
+            f"The run {why} ({where}).\n\n{detail}\n\nResume to continue from the saved session, or cancel." + _handed_over(out),
             usage,
         )
         return "max-turns" if max_turns_hit else "error"

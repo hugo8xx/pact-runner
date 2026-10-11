@@ -86,10 +86,11 @@ nothing and exits 0. Each installed hook looks like this:
 
 One process per runner agent, on a machine that has a logged-in `claude`:
 
-1. Every 30 s it calls `pact_list(since=…)` and keeps the tasks delegated to it (`PACT_RUNNER_TAKE_OPEN=1`
+1. Every 30 s, or as soon as `pact_events` answers, it calls `pact_list(since=…)` and keeps the tasks delegated to it (`PACT_RUNNER_TAKE_OPEN=1`
    also takes undelegated ones).
 2. It claims one with `reserve={"runs": 1}`, so a task whose budget has no run left is never
-   started. `--max-turns` is the smaller of `PACT_RUNNER_MAX_TURNS` and the turns left in the budget.
+   started. `--max-turns` is the smaller of `PACT_RUNNER_MAX_TURNS` and the turns left in the budget,
+   less 8 turns kept back for a hand-over (step 6) when that leaves at least 8 to work with.
 3. It runs `claude -p --output-format stream-json` in a git worktree on branch `runner/<task>`. The
    process gets its own process group. These limits apply:
    - Only the tools in the allowlist, with `--permission-mode default`; never
@@ -123,6 +124,11 @@ One process per runner agent, on a machine that has a logged-in `claude`:
    session saved, never a retry loop. When a person answers and resumes the task, the Runner continues
    the same session (`--resume`, without resending the role). If that session is gone, it starts a
    fresh one once.
+   **Hand-over.** When a run hits its turns or time limit, the Runner first resumes the same session
+   for the turns it kept back: the session commits what it has as work in progress, pushes the branch
+   (through the same guard) and writes a `## Handoff` (done, left, checks, branch and commit). That
+   handoff goes into the `input_required` report, so a person or another agent can pick the task up
+   from the branch instead of a worktree on one machine. A usage limit gets no hand-over.
 7. **Sub-agents.** With `PACT_RUNNER_WORKERS=worker-a,…` (other runner agents), the role tells the
    session how to split off work: `pact_post(delegate_to=<worker>, parent_task_id=<task>,
    child_limits=…)` taken from its own budget, then end with status `waiting`. No person approves
